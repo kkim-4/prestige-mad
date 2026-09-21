@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+calls.jsonl
+results.json
+*.env
