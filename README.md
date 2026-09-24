@@ -1,77 +1,134 @@
-# MAD on Gemini — refined small-scale build
+# Prestige-Weighted, Confidence-Scored Multi-Agent Debate
 
-Prestige-weighted, confidence-scored multi-agent debate on the Gemini API
-(Google AI Studio key). Same mechanism as the Claude MVP, with the gaps closed.
+A small-scale test of a simple idea: if you score each agent's stated confidence
+against whether it was actually right, and let that running score decide who gets
+heard, does a group of LLM agents produce more stable, more accurate answers than
+if confidence carries no consequence?
 
-## What "refined" changed
+Single self-contained script (`mad_gemini.py`, ~750 lines), built against the
+Gemini API on Vertex AI. No framework — the debate loop, scoring rule, and
+evaluation harness are all plain Python.
 
-| Area | Claude MVP | This build |
-|---|---|---|
-| Output contract | Prompted JSON + regex fallback | Pydantic schema enforced server-side via `response_format`; a bad response is retried, never silently parsed |
-| Confidence prompt | "report your probability" | Adds `key_uncertainty` field (forces the agent to name a failure mode before stating a number — cheap, tends to improve calibration) and explicit anti-deference instruction |
-| Baselines | round-robin, fixed, conf-only, prestige-only | + `posthoc`: Platt scaling fitted on warmup (the Conf-MAD "correct it after the fact" comparison) |
-| Perturbations | order, drop-one | + `fresh` (an agent replaced by a prior-prestige copy that never saw prior problems) and per-kind flip rates |
-| Speaker selection | argmax | argmax or softmax sampling (`--tau`) |
-| Scoring rule | Brier | Brier or log (`--rule log`) |
-| Diagnostics | mean Brier | + ECE per agent, JSONL log of every model call, `results.json` |
-| Throughput | serial | agents within a round run in parallel |
-| Milestone 1 | manual | `run.py calib` — single-agent calibration check before any debate |
+## How it works
+
+- A fixed population of 5 agents (same model, different system-prompt personas —
+  careful, fast, skeptic, teacher, contrarian) discuss a problem over several rounds.
+- Each turn, an agent returns structured JSON: an answer, a stated confidence
+  (0–1), and a named key uncertainty.
+- One speaker per round is selected by **prestige × stated confidence**. Everyone
+  else sees that turn and can revise before the next round.
+- After the final round, the group's answer is a weighted vote over each agent's
+  last submission, grouped by grading-equivalence (not plain string match), so
+  `14/3` and `\frac{14}{3}` combine weight instead of splitting it.
+- Once ground truth is revealed, every agent's confidence is scored against
+  correctness with a proper scoring rule (Brier or log score), and a running
+  **prestige** ledger — an EMA of that score — updates. Prestige is visible to
+  every agent each round; it only updates between problems, never mid-debate.
+
+### Baselines for comparison
+
+| Policy | Weight used |
+|---|---|
+| `prestige_x_conf` | prestige × confidence (the proposed mechanism) |
+| `conf_only` | confidence, with no consequence for being wrong |
+| `posthoc` | confidence, Platt-calibrated after the fact |
+| `prestige_only` | prestige alone (ablation) |
+| `round_robin` | uniform, ignores both |
+| `fixed` | prestige learned during warmup, then frozen |
+
+### Stability evaluation
+
+Each test problem is rerun with prestige frozen — agents reordered, one agent
+dropped, one agent replaced by a fresh copy with prior-only prestige — and the
+flip rate (how often the final answer changes) is measured, split into
+correct→wrong vs. wrong→correct. `--perturbations order,drop,fresh` selects
+which checks run (`drop` is 5x cost; drop it for a faster pass). All selected
+perturbations run concurrently, not sequentially, paced by a shared rate limiter.
 
 ## Setup
 
 ```bash
-pip install -r requirements.txt          # google-genai>=2.3.0, pydantic
-export GEMINI_API_KEY=...                # from https://aistudio.google.com/apikey
-export MAD_MODEL=gemini-3.8-flash        # default; gemini-3.5-flash-lite for cheap sweeps
+pip install google-genai pydantic sympy
 ```
 
-Calls go through the Interactions API (`client.interactions.create`) with `store=False`,
-so nothing is retained server-side and each call is stateless. `thinking_level` is passed
-through when set (`--thinking low|high`); leave unset first, then check whether thinking
-changes the calibration numbers — that itself is a useful ablation.
+**Vertex AI** (needed to draw on Google Cloud trial credit — the Developer API
+uses a separate prepay balance that runs out independently):
+```bash
+gcloud auth application-default login
+export GOOGLE_GENAI_USE_VERTEXAI=True
+export GOOGLE_CLOUD_PROJECT="your-project-id"
+export GOOGLE_CLOUD_LOCATION="us-east4"   # test region reliability before committing to a run
+```
 
-## Run order
+**Gemini Developer API** (simpler, but a separate billing pool from Cloud credit):
+```bash
+export GEMINI_API_KEY="..."
+```
+
+## Usage
 
 ```bash
-# 0. plumbing + mechanism sanity, no API
-python run.py mock --n 80 --seeds 6
+# 0. Sanity-check the mechanism with simulated agents — no API calls
+python3 mad_gemini.py mock --n 80 --seeds 8
 
-# 1. MILESTONE 1 — does Gemini's stated confidence track correctness at all?
-python run.py calib --n 20                              # synthetic arithmetic
-python run.py calib --problems math.jsonl --n 40        # MATH
+# 1. Confirm connectivity — one real call per transport, full errors on failure
+python3 mad_gemini.py smoke
 
-# 2. full comparison
-python run.py debate --problems math.jsonl --n 30 --rounds 3
-python run.py debate --problems math.jsonl --n 30 --policies prestige_x_conf,conf_only,posthoc --tau 0.15
+# 2. MILESTONE 1 — does verbalized confidence actually track correctness?
+python3 mad_gemini.py calib --n 30 --problems aime.jsonl --model gemini-3.8-flash
+
+# 3. Full comparison across policies
+python3 mad_gemini.py debate --problems aime.jsonl --n 30 \
+    --policies round_robin,prestige_x_conf --rounds 3 --perturbations order,fresh
 ```
 
-`math.jsonl` can be raw MATH-format lines (`{"problem","solution"}` — the `\boxed{}` answer
-is extracted) or `{"question","answer"}`.
+Run `python3 mad_gemini.py --help` for the full flag list (rounds, scoring rule,
+softmax speaker sampling, retry pacing/`--stagger`, `--level` filtering, etc).
 
-Cost per test problem per policy ≈ agents × rounds × (canonical + order + N drop + fresh + learn)
-= 5 × 3 × 9 = 135 calls. On Flash that's cheap; on Pro, use `--n 10` first.
+### Problem files
 
-## Reading the output
+JSONL, either:
+- `{"question": "...", "answer": "..."}`, or
+- MATH-style `{"problem": "...", "solution": "...", "level": "Level N"}` — the
+  `\boxed{}` answer is extracted automatically, `--level 4,5` filters by difficulty.
 
-- `calib`: if no persona has `acc ≈ meanconf` and ECE > ~0.2 everywhere, verbalized confidence
-  is not carrying signal on that task. Fix elicitation (lower temperature, `--thinking low`,
-  or swap to sampling-based confidence) before running debates. This is the doc's first gate.
-- `debate`: the hypothesis predicts `prestige_x_conf` < `conf_only` ≈ `posthoc` on flip rate,
-  particularly C→W, with accuracy not worse. `fixed` is the interesting comparison: if it
-  matches `prestige_x_conf`, per-question conditioning isn't earning its place on that benchmark.
+### Analysis tools
 
-## What is deliberately not in here
+- `summarize_calls.py` — rebuilds accuracy/confidence tables from `calls.jsonl`,
+  auto-sorting a mixed-session log by model and dataset. Supports `--since
+  <unix_ts>` to isolate one run from a log spanning many attempts, and
+  `--warmup-vs-test` to check whether debate-phase accuracy differs from a
+  clean solo baseline.
+- `analyze_calibration.py` — isolates "confidently wrong" and "hedged but
+  right" calls from a log, with per-agent bluffing/hedging rates.
 
-- LangGraph. The loop is ~80 lines; migrate when you add the challenge phase.
-- Step-level scoring (PRM800K / Math-Shepherd). Swap the `correct` computation in
-  `Orchestrator.run`'s update loop.
-- Batch API — not available on Interactions yet; if cost matters, the legacy
-  `generateContent` path supports it.
+## Findings so far
 
-## Using AI Studio itself
+**Model/dataset capability bracket:** the "does confidence track correctness"
+signal only shows up in a narrow band. Every dataset easier than AIME saturates
+`gemini-3.8-flash` (MATH at any level, AMC 12 — 100% accuracy, confidence
+pinned at 0.99, ECE ~0.01). Every cheaper "lite" model tried bottoms out badly
+even on AIME (10–27% accuracy, ECE 0.5–0.8). Only `gemini-3.8-flash` on
+AIME-tier difficulty (87–90% accuracy, real confidence spread) is usable —
+this looks like a genuine threshold, not a smooth gradient.
 
-The Playground can't run an orchestrator loop, so the script is the right tool. Two things
-AI Studio does add: the Logs page (paid tier) shows every stored interaction if you set
-`store=True` in `agents.py`, which is a convenient debugger for reading agent rationales;
-and Build mode can vibe-code a small web front-end over `results.json` / `calls.jsonl` for
-inspecting transcripts — the JSONL format here was chosen to make that trivial.
+**First debate comparison** (AIME 2024, n=5, small sample): `prestige_x_conf`
+matched `round_robin` on accuracy (0.33 each) but cut flip rate 3.8x (0.10 vs
+0.38) and had zero correct→wrong flips vs. round_robin's answer flipping on
+*every* reordering. Directional support for the hypothesis; n=3 test problems
+is not enough to trust the exact numbers.
+
+## Known limitations / next steps
+
+- Scaling the debate comparison beyond n~10 has been blocked by Vertex
+  throughput collapsing intermittently (not cost — measured ~$0.009/call).
+  Retry when connection quality recovers; `smoke` is a cheap pre-check but
+  doesn't guarantee a long run stays healthy.
+- AIME 2024 alone is only 30 problems; `aime_combined.jsonl` (2024+2025, 60)
+  and `matharena.jsonl` (139, pooled 2025 competitions) are prepared for when
+  throughput allows a larger run.
+- Confidence currently scores the final answer only, not intermediate steps.
+- `--api interactions` is not available under Vertex AI — use the default
+  `legacy` transport there.
+- Credit assignment currently rewards calibration only, not influence —
+  doesn't yet distinguish "right and heard" from "right but ignored."
