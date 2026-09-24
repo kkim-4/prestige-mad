@@ -269,7 +269,7 @@ class GeminiAgent:
                 text = self._call(prompt)
                 turn = AgentTurn.model_validate_json(text).clipped()
                 self._log({"agent": self.agent_id, "model": self.model, "api": self.api,
-                           "q": problem["question"], "round": len(transcript),
+                           "ts": time.time(), "q": problem["question"], "round": len(transcript),
                            "out": turn.model_dump(), "latency_s": round(time.time() - t0, 2)})
                 return turn
             except Exception as e:
@@ -483,7 +483,8 @@ class Metrics:
 
 
 def evaluate(make_agents, problems, policy, rounds=3, warmup_frac=0.4, alpha=0.3,
-             rule="brier", stake=False, tau=None, seed=0, verbose=False) -> Metrics:
+             rule="brier", stake=False, tau=None, seed=0, verbose=False,
+             perturbations=("order", "drop", "fresh")) -> Metrics:
     rng = random.Random(seed)
     agents = make_agents()
     ids = [a.agent_id for a in agents]
@@ -508,25 +509,36 @@ def evaluate(make_agents, problems, policy, rounds=3, warmup_frac=0.4, alpha=0.3
     for i, p in enumerate(test):
         canon = orch.run(p, update_prestige=False)
         n_correct += canon.correct
-        pert = []
 
-        shuffled = agents[:]
-        rng.shuffle(shuffled)
-        pert.append(("order", Orchestrator(shuffled, ledger, policy, rounds, tau, scaler, seed=seed).run(p, False)))
+        # Build the list of (kind, orchestrator) jobs to run — independent of
+        # each other (all update_prestige=False), so they run concurrently
+        # instead of one-after-another. The shared rate limiter still paces
+        # the underlying API calls, so this doesn't cause bursting.
+        jobs = []
+        if "order" in perturbations:
+            shuffled = agents[:]
+            rng.shuffle(shuffled)
+            jobs.append(("order", Orchestrator(shuffled, ledger, policy, rounds, tau, scaler, seed=seed)))
+        if "drop" in perturbations:
+            for j in range(len(agents)):
+                sub = agents[:j] + agents[j + 1:]
+                jobs.append(("drop", Orchestrator(sub, ledger, policy, rounds, tau, scaler, seed=seed)))
+        if "fresh" in perturbations:
+            j = rng.randrange(len(agents))
+            fresh = copy.copy(agents[j])
+            fresh.agent_id = f"{agents[j].agent_id}_fresh"
+            fresh_ledger = copy.deepcopy(ledger)
+            fresh_ledger.values[fresh.agent_id] = ledger.prior
+            sub = agents[:j] + [fresh] + agents[j + 1:]
+            jobs.append(("fresh", Orchestrator(sub, fresh_ledger, policy, rounds, tau, scaler, seed=seed)))
 
-        for j in range(len(agents)):
-            sub = agents[:j] + agents[j + 1:]
-            pert.append(("drop", Orchestrator(sub, ledger, policy, rounds, tau, scaler, seed=seed).run(p, False)))
+        if jobs:
+            with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+                results = list(ex.map(lambda kj: (kj[0], kj[1].run(p, False)), jobs))
+        else:
+            results = []
 
-        j = rng.randrange(len(agents))
-        fresh = copy.copy(agents[j])
-        fresh.agent_id = f"{agents[j].agent_id}_fresh"
-        fresh_ledger = copy.deepcopy(ledger)
-        fresh_ledger.values[fresh.agent_id] = ledger.prior
-        sub = agents[:j] + [fresh] + agents[j + 1:]
-        pert.append(("fresh", Orchestrator(sub, fresh_ledger, policy, rounds, tau, scaler, seed=seed).run(p, False)))
-
-        for kind, r in pert:
+        for kind, r in results:
             kind_n[kind] += 1
             if norm(r.final_answer) != norm(canon.final_answer):
                 flips += 1
@@ -694,8 +706,10 @@ def cmd_debate(a):
     for pol in a.policies.split(","):
         print(f"\n=== {pol}")
         try:
+            perts = tuple(a.perturbations.split(","))
             m = evaluate(gemini_population(a), probs, pol, a.rounds, alpha=a.alpha,
-                         rule=a.rule, stake=a.stake, tau=a.tau, verbose=True)
+                         rule=a.rule, stake=a.stake, tau=a.tau, verbose=True,
+                         perturbations=perts)
             print(m.row())
             ms.append(m)
         except Exception as e:
@@ -733,6 +747,10 @@ def main():
     ap.add_argument("--out", default="results.json")
     ap.add_argument("--stagger", type=float, default=0.3,
                     help="seconds between call starts across all agents (paces bursts to the API)")
+    ap.add_argument("--perturbations", default="order,drop,fresh",
+                    help="which stability checks to run (comma-sep, subset of order,drop,fresh). "
+                        "'drop' is 5x cost (one run per agent removed) — drop it for a faster/"
+                        "cheaper first pass, e.g. --perturbations order,fresh")
     a = ap.parse_args()
     _RATE_LIMITER.min_interval = a.stagger
     {"smoke": cmd_smoke, "mock": cmd_mock, "calib": cmd_calib, "debate": cmd_debate}[a.cmd](a)
