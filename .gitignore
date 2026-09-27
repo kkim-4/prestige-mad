@@ -5,3 +5,4 @@ calls.jsonl
 results.json
 summary*.md
 *.env
+.DS_Store
