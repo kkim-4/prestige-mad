@@ -1,134 +1,109 @@
 # Prestige-Weighted, Confidence-Scored Multi-Agent Debate
 
-A small-scale test of a simple idea: if you score each agent's stated confidence
-against whether it was actually right, and let that running score decide who gets
-heard, does a group of LLM agents produce more stable, more accurate answers than
-if confidence carries no consequence?
+Does scoring each LLM agent's stated confidence against whether it was actually
+right, and letting that running score decide who gets heard, make a group of
+agents more accurate or more stable than a debate where confidence carries no
+consequence?
 
-Single self-contained script (`mad_gemini.py`, ~750 lines), built against the
-Gemini API on Vertex AI. No framework — the debate loop, scoring rule, and
-evaluation harness are all plain Python.
+One self-contained script (`mad_gemini.py`) on the Gemini API, plain Python, no framework.
 
 ## How it works
 
-- A fixed population of 5 agents (same model, different system-prompt personas —
-  careful, fast, skeptic, teacher, contrarian) discuss a problem over several rounds.
-- Each turn, an agent returns structured JSON: an answer, a stated confidence
-  (0–1), and a named key uncertainty.
-- One speaker per round is selected by **prestige × stated confidence**. Everyone
-  else sees that turn and can revise before the next round.
-- After the final round, the group's answer is a weighted vote over each agent's
-  last submission, grouped by grading-equivalence (not plain string match), so
-  `14/3` and `\frac{14}{3}` combine weight instead of splitting it.
-- Once ground truth is revealed, every agent's confidence is scored against
-  correctness with a proper scoring rule (Brier or log score), and a running
-  **prestige** ledger — an EMA of that score — updates. Prestige is visible to
-  every agent each round; it only updates between problems, never mid-debate.
+- 5 agents (same model, different personas: careful, fast, skeptic, teacher,
+  contrarian) debate a problem for several rounds. Each turn returns JSON:
+  answer, confidence (0–1), key uncertainty.
+- Each round one speaker is chosen by the policy; everyone sees that turn and may revise.
+- Final answer = weighted vote over last-round answers, grouping mathematically
+  equivalent forms (`14/3` = `\frac{14}{3}`).
+- After each problem, confidences are scored against the truth with a proper
+  scoring rule (Brier or log), and each agent's **prestige** (an EMA of that
+  score) updates. Prestige never changes mid-debate.
 
-### Baselines for comparison
-
-| Policy | Weight used |
+| Policy | Speaker / vote weight |
 |---|---|
-| `prestige_x_conf` | prestige × confidence (the proposed mechanism) |
-| `conf_only` | confidence, with no consequence for being wrong |
-| `posthoc` | confidence, Platt-calibrated after the fact |
-| `prestige_only` | prestige alone (ablation) |
-| `round_robin` | uniform, ignores both |
-| `fixed` | prestige learned during warmup, then frozen |
+| `prestige_x_conf` | prestige × confidence (proposed) |
+| `conf_only` | confidence, no consequence |
+| `posthoc` | Platt-calibrated confidence |
+| `prestige_only` | prestige alone |
+| `round_robin` | rotate speaker, unweighted vote |
+| `fixed` | prestige frozen after warmup |
 
-### Stability evaluation
-
-Each test problem is rerun with prestige frozen — agents reordered, one agent
-dropped, one agent replaced by a fresh copy with prior-only prestige — and the
-flip rate (how often the final answer changes) is measured, split into
-correct→wrong vs. wrong→correct. `--perturbations order,drop,fresh` selects
-which checks run (`drop` is 5x cost; drop it for a faster pass). All selected
-perturbations run concurrently, not sequentially, paced by a shared rate limiter.
+**Stability:** each test problem is rerun with prestige frozen under
+perturbations (`--perturbations order,drop,fresh`: reorder agents, drop one,
+swap in a fresh agent), and we count how often the final answer flips,
+split into correct→wrong and wrong→correct.
 
 ## Setup
 
 ```bash
-pip install google-genai pydantic sympy
-```
+pip install -r requirements.txt   # google-genai, pydantic, sympy (sympy is required for answer grading)
 
-**Vertex AI** (needed to draw on Google Cloud trial credit — the Developer API
-uses a separate prepay balance that runs out independently):
-```bash
+# Vertex AI (bills Google Cloud credit)
 gcloud auth application-default login
-export GOOGLE_GENAI_USE_VERTEXAI=True
-export GOOGLE_CLOUD_PROJECT="your-project-id"
-export GOOGLE_CLOUD_LOCATION="us-east4"   # test region reliability before committing to a run
-```
-
-**Gemini Developer API** (simpler, but a separate billing pool from Cloud credit):
-```bash
-export GEMINI_API_KEY="..."
+export GOOGLE_GENAI_USE_VERTEXAI=True GOOGLE_CLOUD_PROJECT=your-project GOOGLE_CLOUD_LOCATION=us-east4
+# or the Developer API (separate prepaid balance)
+export GEMINI_API_KEY=...
 ```
 
 ## Usage
 
 ```bash
-# 0. Sanity-check the mechanism with simulated agents — no API calls
-python3 mad_gemini.py mock --n 80 --seeds 8
-
-# 1. Confirm connectivity — one real call per transport, full errors on failure
-python3 mad_gemini.py smoke
-
-# 2. MILESTONE 1 — does verbalized confidence actually track correctness?
-python3 mad_gemini.py calib --n 30 --problems aime.jsonl --model gemini-3.8-flash
-
-# 3. Full comparison across policies
-python3 mad_gemini.py debate --problems aime.jsonl --n 30 \
-    --policies round_robin,prestige_x_conf --rounds 3 --perturbations order,fresh
+python3 mad_gemini.py mock --n 80 --seeds 8        # simulated agents, no API calls
+python3 mad_gemini.py smoke                         # one real call, full errors
+python3 mad_gemini.py calib --problems math.jsonl --n 100 --model gemini-3.1-flash-lite
+date +%s    # note the timestamp so this run's calls can be isolated later
+python3 mad_gemini.py trials --problems math.jsonl --n 100 --seeds 3 --model gemini-3.1-flash-lite \
+    --policies round_robin,prestige_x_conf --stagger 0.3 --workers 6 --store trials.jsonl --dry-run
+python3 mad_gemini.py report --store trials.jsonl   # regrade + summarize, no API calls
 ```
 
-Run `python3 mad_gemini.py --help` for the full flag list (rounds, scoring rule,
-softmax speaker sampling, retry pacing/`--stagger`, `--level` filtering, etc).
+`trials` is resumable: rerun the same command after a crash or Ctrl-C.
 
-### Problem files
+Problem files are JSONL: `{"question", "answer"}` or MATH-style
+`{"problem", "solution", "level"}` (the `\boxed{}` answer is extracted;
+`--level 4,5` filters). All calls are logged to `calls.jsonl`. Two scripts
+analyze that log:
 
-JSONL, either:
-- `{"question": "...", "answer": "..."}`, or
-- MATH-style `{"problem": "...", "solution": "...", "level": "Level N"}` — the
-  `\boxed{}` answer is extracted automatically, `--level 4,5` filters by difficulty.
-
-### Analysis tools
-
-- `summarize_calls.py` — rebuilds accuracy/confidence tables from `calls.jsonl`,
-  auto-sorting a mixed-session log by model and dataset. Supports `--since
-  <unix_ts>` to isolate one run from a log spanning many attempts, and
-  `--warmup-vs-test` to check whether debate-phase accuracy differs from a
-  clean solo baseline.
-- `analyze_calibration.py` — isolates "confidently wrong" and "hedged but
-  right" calls from a log, with per-agent bluffing/hedging rates.
+- `summarize_calls.py`: accuracy and confidence tables by model and dataset
+  (`--since <ts>` isolates one run).
+- `analyze_calibration.py`: confidently-wrong and hedged-but-right answers per agent.
 
 ## Findings so far
 
-**Model/dataset capability bracket:** the "does confidence track correctness"
-signal only shows up in a narrow band. Every dataset easier than AIME saturates
-`gemini-3.8-flash` (MATH at any level, AMC 12 — 100% accuracy, confidence
-pinned at 0.99, ECE ~0.01). Every cheaper "lite" model tried bottoms out badly
-even on AIME (10–27% accuracy, ECE 0.5–0.8). Only `gemini-3.8-flash` on
-AIME-tier difficulty (87–90% accuracy, real confidence spread) is usable —
-this looks like a genuine threshold, not a smooth gradient.
+**Main result (`trials`: gemini-3.1-flash-lite, 100 MATH problems, 3 seeds, 3 rounds, no warmup).**
+Mean ± SD across seeds; results in `results/`.
 
-**First debate comparison** (AIME 2024, n=5, small sample): `prestige_x_conf`
-matched `round_robin` on accuracy (0.33 each) but cut flip rate 3.8x (0.10 vs
-0.38) and had zero correct→wrong flips vs. round_robin's answer flipping on
-*every* reordering. Directional support for the hypothesis; n=3 test problems
-is not enough to trust the exact numbers.
+| Method | Accuracy | Flip | C→W |
+|---|---|---|---|
+| Single agent (round 1) | 81.1 ± 2.3% | – | – |
+| Majority vote, no debate | 85.3 ± 2.3% | – | – |
+| Round-robin debate | **88.3 ± 1.5%** | 9.7 ± 2.5% | 4.3 ± 2.1% |
+| Prestige × confidence | 86.0 ± 1.7% | **6.7 ± 2.3%** | **2.0 ± 2.6%** |
 
-## Known limitations / next steps
+Paired differences (prestige × confidence − round robin, 95% bootstrap CI over problems):
+accuracy −2.3 [−5.7, +0.3], flip −3.0 [−6.7, +0.3], C→W −2.3 [−5.3, +0.3]. None significant.
 
-- Scaling the debate comparison beyond n~10 has been blocked by Vertex
-  throughput collapsing intermittently (not cost — measured ~$0.009/call).
-  Retry when connection quality recovers; `smoke` is a cheap pre-check but
-  doesn't guarantee a long run stays healthy.
-- AIME 2024 alone is only 30 problems; `aime_combined.jsonl` (2024+2025, 60)
-  and `matharena.jsonl` (139, pooled 2025 competitions) are prepared for when
-  throughput allows a larger run.
-- Confidence currently scores the final answer only, not intermediate steps.
-- `--api interactions` is not available under Vertex AI — use the default
-  `legacy` transport there.
-- Credit assignment currently rewards calibration only, not influence —
-  doesn't yet distinguish "right and heard" from "right but ignored."
+- **Debate helps:** round robin beats majority vote by 3 points and one agent by 7.
+- **Prestige × confidence doesn't beat round robin.** It trends more stable but less accurate,
+  most visibly on contested problems (73.9% vs 81.6%).
+- **Likely reason:** with near-identical agents and confidence pinned near 0.99, it hands the
+  floor to the confident majority every round, so a correct dissenter is rarely heard.
+- In the mock test with genuinely different agents, prestige × confidence does win.
+
+`trials` scores prestige from each agent's independent first-round answer (running mean,
+prior 0.5 worth 5 problems), so every problem is scored and debates run in parallel. Both
+policies share the same first-round answers (paired). Earlier single-run results (76.7% for
+both policies, old grader, 40% warmup) are superseded.
+
+## Next steps
+
+- Check the mechanism from stored data: speaker agreement with the round-1 majority per policy.
+- Sample the speaker by weight (`--tau`) instead of always picking the top one.
+- Mixed-skill population (different models or thinking levels) so reliability actually varies.
+- More problems rather than more seeds: the paired CI is about ±3 points at n=100.
+
+## Known issues
+
+- Vertex AI connections drop intermittently; retries with jittered backoff absorb
+  most of it, but long runs are slow. Cost is ~$0.009/call.
+- `--api interactions` isn't available on Vertex; use the default `legacy` transport.

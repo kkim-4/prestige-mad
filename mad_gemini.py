@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-mad_gemini.py — prestige-weighted, confidence-scored multi-agent debate, all in one file.
+mad_gemini.py — prestige-weighted, confidence-scored multi-agent debate, one file.
 
 Setup:
-    pip install google-genai pydantic sympy
+    pip install google-genai pydantic
     export GEMINI_API_KEY="..."
 
 Use:
@@ -11,13 +11,8 @@ Use:
     python3 mad_gemini.py mock                      # mechanism sanity check, no API
     python3 mad_gemini.py calib --n 20              # does stated confidence track correctness?
     python3 mad_gemini.py debate --problems math.jsonl --n 15
-
-Independence options (new):
-    --board full|blind      blind hides others' confidence and prestige from the transcript
-    --population same|mixed mixed = personas spread across different models / thinking levels
-    --panel SPEC            custom panel, e.g.
-                            "careful@gemini-3.8-flash:high,fast@gemini-3.1-flash-lite:low:1.0"
-                            format per agent: persona[@model][:thinking][:temperature]
+    python3 mad_gemini.py trials --problems math.jsonl --n 100 --seeds 3 --workers 6 --stagger 0.2
+    python3 mad_gemini.py report --store trials.jsonl       # regrade + summarize, no API calls
 
 Transport: defaults to the stable generateContent endpoint. Use --api interactions
 to try the newer one.
@@ -43,32 +38,16 @@ from pydantic import BaseModel, Field
 # ===========================================================================
 # 1. SCHEMA — the contract every agent response must satisfy
 # ===========================================================================
-# Field order matters: structured output is generated in this order, so the
-# agent names its method and reasoning, commits to an answer, says whether it
-# changed and why, names its biggest doubt, and only THEN states a confidence.
-# No field has a default value: the Gemini response_schema rejects defaults.
 
 class AgentTurn(BaseModel):
-    method: str = Field(
-        description="The approach you used, in a few words (e.g. 'complementary counting', "
-                    "'coordinates', 'substitution check').")
-    rationale: str = Field(
-        description="Your reasoning in at most 5 sentences: the key steps, the check you ran, "
-                    "and (after round 0) where you agree or disagree with other agents.")
+    rationale: str = Field(description="Brief reasoning, at most 3 sentences.")
     answer: str = Field(description="Final answer only, no units or explanation.")
-    changed_answer: bool = Field(
-        description="True only if this answer differs from your own previous-round answer. "
-                    "Always false on your first attempt.")
-    change_reason: str = Field(
-        description="If changed_answer is true: the specific step (yours or another agent's, "
-                    "verified by you) that made you change. Otherwise an empty string.")
-    key_uncertainty: str = Field(
-        description="The single thing most likely to make `answer` wrong.")
     confidence: float = Field(
         ge=0.0, le=1.0,
-        description="Honest probability that `answer` is correct, using the confidence bands "
-                    "in your instructions. Scored with a proper scoring rule against ground "
-                    "truth after the problem closes.")
+        description="Honest probability that `answer` is correct. Scored with a proper "
+                    "scoring rule against ground truth after the problem closes.")
+    key_uncertainty: str = Field(
+        description="The single thing most likely to make `answer` wrong.")
 
     def clipped(self) -> "AgentTurn":
         self.confidence = min(0.99, max(0.01, float(self.confidence)))
@@ -185,233 +164,43 @@ class PlattScaler:
 
 
 # ===========================================================================
-# 3. PERSONAS & PROMPTS — built to make agents work independently
+# 3. AGENTS — interface: propose(problem, transcript, prestige) -> AgentTurn
 # ===========================================================================
-# Each persona differs in HOW it solves (method), HOW it verifies (check), and
-# HOW it treats the transcript (stance), not just in temperament. Different
-# methods make different mistakes, which is what gives a vote or a debate
-# something to work with.
 
 PERSONAS = {
-    "careful": {
-        "title": "the methodical deriver",
-        "method": (
-            "Restate the givens and exactly what is being asked, in your own words. Then "
-            "derive the answer forward in small, explicit steps, keeping exact forms "
-            "(fractions, radicals, pi) until the very end. Do not skip steps you could do in "
-            "your head: slips happen in the steps you skip."),
-        "check": (
-            "Substitute your answer back into the original conditions, or recompute the "
-            "single most error-prone step by a different arithmetic route. If the check "
-            "fails, find the step that broke before you answer."),
-        "stance": (
-            "Treat every answer in the transcript as a hypothesis to test against your own "
-            "derivation, never as a shortcut. If someone disagrees with you, find the first "
-            "line where your work and theirs diverge and decide that line on its merits."),
-        "watch": (
-            "Arithmetic and sign slips, dropped cases, and quietly changing the problem "
-            "while restating it."),
-    },
-    "fast": {
-        "title": "the estimator",
-        "method": (
-            "Before computing anything, write down a rough estimate or bound for the answer: "
-            "its sign, size, parity or range, and anything else visible at a glance. Then "
-            "take the most direct route you know, using standard results and shortcuts where "
-            "their conditions genuinely hold."),
-        "check": (
-            "Confirm the final answer falls inside your estimate and satisfies an easy "
-            "special case (a small n, a degenerate shape, a simple value). If the estimate "
-            "and the computation disagree, one of them is wrong: find out which."),
-        "stance": (
-            "Commit to your own number. If the transcript disagrees, say so plainly and test "
-            "whether their answer passes your estimate. Adopt it only if it passes and you "
-            "can see where your own route went wrong."),
-        "watch": (
-            "Applying a formula outside its conditions, and missing a constraint stated in "
-            "the problem."),
-    },
-    "skeptic": {
-        "title": "the adversarial checker",
-        "method": (
-            "First solve the problem yourself by whatever method you trust. Then turn on "
-            "your own answer and try to break it: test boundary and degenerate cases, confirm "
-            "every condition in the problem was used, and ask whether a nearby answer (off by "
-            "one, a missing factor of 2, ordered vs unordered counting) would look just as "
-            "plausible."),
-        "check": (
-            "An answer survives only if you tried at least one concrete way it could be "
-            "wrong and it held up. Name that attempt in your rationale."),
-        "stance": (
-            "For each answer in the transcript, look for the flaw before looking for the "
-            "merit. Agree only after an honest attempt to find an error has failed. Being "
-            "the lone dissenter is acceptable and often valuable; being talked into "
-            "agreement without a verified reason is not."),
-        "watch": (
-            "Accepting a confident, fluent argument without checking it, including your "
-            "own."),
-    },
-    "teacher": {
-        "title": "the careful reader",
-        "method": (
-            "Start with the wording. Identify definitions, units, domain restrictions "
-            "(integers? positive? distinct?), and exactly which quantity and form is "
-            "requested (simplest form, interval notation, a given base, degrees vs radians, "
-            "a sum vs a count). Then solve with the simplest clean approach, as a worked "
-            "solution a student could follow line by line."),
-        "check": (
-            "Reread the question after solving and confirm your answer is the quantity "
-            "asked for, in the form asked for. Many wrong answers are correct answers to a "
-            "slightly different question."),
-        "stance": (
-            "Judge other agents' reasoning by whether it answers the question as written and "
-            "whether each step follows from the last. Point out when another agent answered "
-            "a different question or gave the right value in the wrong form."),
-        "watch": "Misreading the problem, and answering in the wrong format.",
-    },
-    "contrarian": {
-        "title": "the alternate-route solver",
-        "method": (
-            "Deliberately solve by a different method from the most obvious one: "
-            "complementary counting instead of direct counting, coordinates instead of "
-            "synthetic geometry, algebra instead of a memorized formula, enumerating small "
-            "cases to find a pattern, or working backward from the answer's form. Carry "
-            "that alternative route all the way to a final value."),
-        "check": (
-            "If a second route is quick, do it too. Two different methods that agree are "
-            "much stronger evidence than one method done twice."),
-        "stance": (
-            "When the transcript has converged, you are most useful: re-derive by a "
-            "different route and report what you actually get. Agree only if your "
-            "independent route lands on the same answer; if it does not, say which result "
-            "you trust and why."),
-        "watch": (
-            "Groupthink, and also the opposite error of disagreeing for its own sake. Your "
-            "job is independent verification, not contrarian answers."),
-    },
+    "careful":    "You are a careful, methodical solver. Verify each step before committing.",
+    "fast":       "You are a fast, intuitive solver. Commit quickly, but report confidence honestly.",
+    "skeptic":    "You are a skeptic. Before agreeing with anyone, look for the flaw in their reasoning.",
+    "teacher":    "You are a patient teacher. Reason cleanly and simply.",
+    "contrarian": "You try an alternative approach before accepting the obvious one.",
 }
 
+SYSTEM = """{persona}
 
-def render_persona(key: str) -> str:
-    p = PERSONAS[key]
-    return (f"You are {key.upper()}, {p['title']}.\n\n"
-            f"HOW YOU SOLVE:\n{p['method']}\n\n"
-            f"HOW YOU CHECK:\n{p['check']}\n\n"
-            f"HOW YOU TREAT OTHER AGENTS:\n{p['stance']}\n\n"
-            f"YOUR TYPICAL FAILURE TO GUARD AGAINST:\n{p['watch']}")
+You are one agent in a small group solving a problem over several rounds.
+Each round you see the transcript of who spoke, what they answered, their
+stated confidence, and their PRESTIGE (0-1): a running record of how well
+that agent's stated confidence has matched actual correctness on past problems.
 
+Your own stated confidence will be scored against the true answer with a
+proper scoring rule after this problem closes. Being confident and wrong
+costs you prestige; being right but hedged also costs you some. You maximise
+your expected score only by reporting the probability you actually believe.
+Prestige decides how much say you get in future rounds.
 
-BOARD_NOTE = {
-    "full": (
-        "Each round you see a transcript of the agent chosen to speak: their answer, method, "
-        "reasoning, stated confidence, and PRESTIGE (0-1), a running record of how well that "
-        "agent's stated confidence has matched actual correctness on past problems."),
-    "blind": (
-        "Each round you see a transcript of the agent chosen to speak: their answer, method "
-        "and reasoning. Their confidence and track record are hidden on purpose: judge the "
-        "argument, not the reputation."),
-}
-
-SYSTEM = """{persona_block}
-
-=== THE GROUP ===
-You are one agent in a small group solving a math problem over several rounds.
-{board_note}
-After the last round, the group's answer is decided by a vote over every agent's
-final answer.
-
-=== WORKING INDEPENDENTLY ===
-1. Solve it yourself first. In every round, work the problem from the statement
-   using YOUR method (above) before you weigh anything in the transcript. The
-   transcript is evidence to examine, not an answer key.
-2. The other agents run on similar models and share many of your blind spots.
-   Several agents agreeing is much weaker evidence than it looks: a shared answer
-   can be a shared mistake.
-3. Change your answer only for a concrete reason: a specific step in your own
-   earlier work that you now see is wrong, or a specific argument in the
-   transcript that you have checked yourself. "Others agree", "higher prestige"
-   or "higher confidence" is never a reason on its own. If you change, set
-   changed_answer=true and name that step in change_reason.
-4. If you keep an answer that others dispute, say in your rationale where you
-   believe their reasoning fails.
-5. Dissent is useful. The final answer is a vote, and an honest minority answer
-   helps the group more than a copied one. Being the only agent with a different
-   answer is fine if your work supports it.
-6. Stay in your role: use your own method even when another method has already
-   been posted.
-
-=== CONFIDENCE ===
-Your stated confidence is scored against the true answer with a proper scoring
-rule after the problem closes. Being confident and wrong costs you prestige; being
-right but hedged costs you some too. You maximise your expected score only by
-reporting the probability you actually believe. Prestige decides how much say you
-get in future rounds. Use these bands:
-  0.97-0.99  solved AND confirmed by an independent check (a second method,
-             substitution into the original conditions, or full enumeration),
-             and you are sure you answered exactly what was asked
-  0.85-0.95  one clean derivation plus a partial check
-  0.60-0.80  a derivation you believe but did not verify, or one shaky step
-  0.30-0.60  choosing between candidate answers
-  below 0.30 mostly a guess
-Other agents agreeing does NOT move you into a higher band unless their reasoning
-let you verify a step you could not verify alone."""
+Do not defer to another agent merely because they sound sure. Weigh their
+prestige, their reasoning, and your own work."""
 
 USER = """PROBLEM:
 {question}
-{standings}
-YOUR PREVIOUS ANSWER:
-{own_prev}
 
-STEP 1. Work the problem yourself with your own method, from the statement, before
-reading the transcript below.
+CURRENT PRESTIGE: {standings}
 
-TRANSCRIPT SO FAR (what the chosen speakers said; examine it critically):
+TRANSCRIPT SO FAR:
 {board}
 
-STEP 2. Compare your independent result with the transcript. Keep or change your
-answer according to the rules in your instructions, then respond in the required
-JSON format."""
+Solve the problem and respond in the required JSON format."""
 
-
-def render_system(persona: str, board: str = "full") -> str:
-    return SYSTEM.format(persona_block=render_persona(persona), board_note=BOARD_NOTE[board])
-
-
-def render_user(agent_id: str, problem: dict, transcript: list, prestige: dict,
-                own_prev=None, board: str = "full") -> str:
-    lines = []
-    for t in transcript:
-        who = t["speaker"] + (" (you)" if t["speaker"] == agent_id else "")
-        if board == "full":
-            head = (f"[round {t['round']}] {who} (prestige {t['speaker_prestige']:.2f}, "
-                    f"confidence {t['confidence']:.2f}) -> {t['answer']}")
-        else:
-            head = f"[round {t['round']}] {who} -> {t['answer']}"
-        lines.append(head)
-        if t.get("method"):
-            lines.append(f"   method: {t['method']}")
-        lines.append(f"   reasoning: {t['rationale']}")
-    board_txt = "\n".join(lines) or "(no one has spoken yet)"
-
-    if board == "full" and prestige:
-        standings = ("\nCURRENT PRESTIGE: "
-                     + ", ".join(f"{a}: {p:.2f}" for a, p in sorted(prestige.items())) + "\n")
-    else:
-        standings = ""
-
-    if own_prev is None:
-        own = "(none; this is your first attempt)"
-    else:
-        own = (f"{own_prev.answer} (your confidence {own_prev.confidence:.2f}; "
-               f"method: {own_prev.method or 'n/a'})")
-
-    return USER.format(question=problem["question"], standings=standings,
-                       own_prev=own, board=board_txt)
-
-
-# ===========================================================================
-# 4. AGENTS — interface: propose(problem, transcript, prestige, own_prev) -> AgentTurn
-# ===========================================================================
 
 class RateLimiter:
     """Paces the START of every API call across all agents/threads so a
@@ -447,7 +236,6 @@ class GeminiAgent:
     max_retries: int = 5
     api: str = None                     # "legacy" (default) | "interactions"; env MAD_API
     verbose_errors: bool = True
-    board: str = "full"                 # "full" | "blind"
 
     _lock = threading.Lock()
 
@@ -464,11 +252,17 @@ class GeminiAgent:
                      "GOOGLE_CLOUD_PROJECT=... GOOGLE_CLOUD_LOCATION=us-central1")
         # 120 s timeout so slow thinking responses don't get dropped
         self.client = genai.Client(http_options=types.HttpOptions(timeout=120_000))
-        self.system = render_system(self.persona, self.board)
+        self.system = SYSTEM.format(persona=PERSONAS[self.persona])
 
-    def propose(self, problem: dict, transcript: list, prestige: dict,
-                own_prev: AgentTurn = None) -> AgentTurn:
-        prompt = render_user(self.agent_id, problem, transcript, prestige, own_prev, self.board)
+    def propose(self, problem: dict, transcript: list, prestige: dict) -> AgentTurn:
+        board = "\n".join(
+            f"[round {t['round']}] {t['speaker']} (prestige {t['speaker_prestige']:.2f}, "
+            f"confidence {t['confidence']:.2f}) -> {t['answer']}\n   reasoning: {t['rationale']}"
+            for t in transcript
+        ) or "(no one has spoken yet)"
+        standings = ("(hidden in the first round)" if prestige is None else
+                     ", ".join(f"{a}: {p:.2f}" for a, p in sorted(prestige.items())))
+        prompt = USER.format(question=problem["question"], standings=standings, board=board)
 
         last_err = None
         for attempt in range(self.max_retries):
@@ -477,13 +271,8 @@ class GeminiAgent:
                 t0 = time.time()
                 text = self._call(prompt)
                 turn = AgentTurn.model_validate_json(text).clipped()
-                self._log({"agent": self.agent_id, "persona": self.persona,
-                           "model": self.model, "thinking": self.thinking_level,
-                           "temperature": self.temperature, "api": self.api,
-                           "board": self.board, "ts": time.time(),
-                           "q": problem["question"], "truth": problem.get("answer"),
-                           "round": len(transcript),
-                           "own_prev": own_prev.answer if own_prev is not None else None,
+                self._log({"agent": self.agent_id, "model": self.model, "api": self.api,
+                           "ts": time.time(), "q": problem["question"], "round": len(transcript),
                            "out": turn.model_dump(), "latency_s": round(time.time() - t0, 2)})
                 return turn
             except Exception as e:
@@ -538,7 +327,7 @@ class MockAgent:
     def __post_init__(self):
         self.rng = self.rng or random.Random(hash(self.agent_id) & 0xFFFF)
 
-    def propose(self, problem, transcript, prestige, own_prev=None) -> AgentTurn:
+    def propose(self, problem, transcript, prestige) -> AgentTurn:
         correct = self.rng.random() < self.accuracy
         d = problem.get("distractors") or [str(problem["answer"]) + "0", "-1"]
         answer = problem["answer"] if correct else (d[0] if self.rng.random() < 0.6 else self.rng.choice(d))
@@ -548,28 +337,41 @@ class MockAgent:
             if self.rng.random() < self.conformity * last["speaker_prestige"] * last["confidence"]:
                 answer, p = last["answer"], max(p, last["confidence"] * 0.8)
         c = min(0.99, max(0.01, p + self.conf_bias + self.rng.gauss(0, 0.05)))
-        changed = own_prev is not None and norm(own_prev.answer) != norm(answer)
-        return AgentTurn(method="mock", rationale="mock", answer=str(answer),
-                         changed_answer=changed, change_reason="mock" if changed else "",
-                         key_uncertainty="", confidence=c)
+        return AgentTurn(rationale="mock", answer=str(answer), confidence=c, key_uncertainty="")
 
 
 # ===========================================================================
-# 5. ORCHESTRATOR — one problem = one debate = N rounds
+# 4. ORCHESTRATOR — one problem = one debate = N rounds
 # ===========================================================================
 
 POLICIES = ["prestige_x_conf", "conf_only", "posthoc", "prestige_only", "round_robin", "fixed"]
 
 
+def _wrap(x: str) -> str:
+    """Parenthesize a fraction part unless it's a single atom, so
+    \\frac{11+9a}{20} becomes (11+9a)/20 rather than 11+9a/20."""
+    x = x.strip()
+    return x if re.fullmatch(r"[\w.]+", x) else f"({x})"
+
+
+_FRAC_ARG = r"(\{[^{}]+\}|\w)"
+
+
 def _strip_latex(s: str) -> str:
     s = str(s).strip()
     s = re.sub(r"\\left|\\right", "", s)
-    s = re.sub(r"\\dfrac", r"\\frac", s)
-    s = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"\1/\2", s)
-    s = re.sub(r"\\sqrt\{([^{}]+)\}", r"sqrt(\1)", s)
+    s = re.sub(r"\\[dt]frac", r"\\frac", s)
+    # vectors/matrices -> tuple: \begin{pmatrix} a \\ b \end{pmatrix} -> (a,b)
+    s = re.sub(r"\\begin\{[pbv]?matrix\}(.*?)\\end\{[pbv]?matrix\}",
+               lambda m: "(" + ",".join(x.strip() for x in re.split(r"\\\\|&", m[1])) + ")", s)
+    # \frac with or without braces: \frac{a}{b}, \frac 34, \frac43, \frac{3}4
+    s = re.sub(r"\\frac\s*" + _FRAC_ARG + r"\s*" + _FRAC_ARG,
+               lambda m: _wrap(m[1].strip("{}")) + "/" + _wrap(m[2].strip("{}")), s)
+    s = re.sub(r"\\sqrt\s*" + _FRAC_ARG, lambda m: f"sqrt({m[1].strip('{}')})", s)
     s = re.sub(r"\\text\{([^{}]*)\}", r"\1", s)
+    s = re.sub(r"_\{(\w+)\}", r"_\1", s)            # 4343_{6} -> 4343_6
     s = s.replace("\\pi", "pi").replace("\\cdot", "*").replace("\\times", "*")
-    s = s.replace("$", "").replace("\\!", "").replace("^\\circ", "")
+    s = s.replace("$", "").replace("\\!", "").replace("^\\circ", "").replace("^{\\circ}", "")
     s = s.replace("\\", "")
     s = s.strip().replace(" ", "")
     return s
@@ -579,19 +381,33 @@ def norm(ans) -> str:
     return _strip_latex(ans).lower().replace(",", "").rstrip(".")
 
 
+def _sympy_equal(na: str, nb: str) -> bool:
+    # skip plain words: implicit multiplication would make "no" == "on"
+    if re.fullmatch(r"[a-z]+", na) or re.fullmatch(r"[a-z]+", nb):
+        return False
+    try:
+        from sympy.parsing.sympy_parser import (parse_expr, standard_transformations,
+                                                implicit_multiplication_application)
+        import sympy
+        tr = standard_transformations + (implicit_multiplication_application,)
+        ea = parse_expr(na.replace("^", "**"), transformations=tr)
+        eb = parse_expr(nb.replace("^", "**"), transformations=tr)
+        return sympy.simplify(ea - eb) == 0
+    except Exception:
+        return False
+
+
 def answers_match(a, b) -> bool:
     """String match after LaTeX normalization; falls back to sympy for
-    algebraic/numeric equivalence (e.g. 14/3 == \\frac{14}{3} == 4.6667)."""
+    algebraic/numeric equivalence (e.g. 14/3 == \\frac{14}{3} == 4.6667,
+    (11+9a)/20 == \\frac{9a+11}{20}). Base subscripts are optional (4343_6 == 4343)."""
     na, nb = norm(a), norm(b)
-    if na == nb:
+    if na == nb or _sympy_equal(na, nb):
         return True
-    try:
-        import sympy
-        ea, eb = sympy.sympify(na), sympy.sympify(nb)
-        if sympy.simplify(ea - eb) == 0:
-            return True
-    except Exception:
-        pass
+    # a base subscript on only one side: compare without it
+    sa, sb = re.sub(r"_\d+$", "", na), re.sub(r"_\d+$", "", nb)
+    if (sa, sb) != (na, nb) and sa == sb:
+        return True
     return False
 
 
@@ -611,8 +427,9 @@ class Orchestrator:
     final answer is a weighted vote over each agent's last submission."""
 
     def __init__(self, agents, ledger: PrestigeLedger, policy="prestige_x_conf", rounds=3,
-                 tau=None, scaler: PlattScaler = None, parallel=True, seed=0):
+                 tau=None, scaler: PlattScaler = None, parallel=True, seed=0, random_ties=False):
         self.agents, self.ledger, self.policy, self.rounds = agents, ledger, policy, rounds
+        self.random_ties = random_ties       # True: equal weights -> random speaker, not list order
         self.tau = tau                       # None -> argmax speaker; float -> softmax
         self.scaler = scaler or PlattScaler()
         self.parallel = parallel
@@ -628,34 +445,31 @@ class Orchestrator:
             return turns[rnd % len(turns)]
         ws = [self.weight(a, t) for a, t in turns]
         if self.tau is None:
+            if self.random_ties:
+                best = max(ws)
+                return self.rng.choice([t for t, w in zip(turns, ws) if w >= best - 1e-12])
             return turns[max(range(len(ws)), key=ws.__getitem__)]
         return self.rng.choices(turns, weights=[math.exp(w / self.tau) for w in ws], k=1)[0]
 
-    def run(self, problem: dict, update_prestige=True) -> DebateResult:
+    def run(self, problem: dict, update_prestige=True, round0: dict = None) -> DebateResult:
         transcript, subs = [], defaultdict(list)
         before = view = self.ledger.snapshot()
 
         for rnd in range(self.rounds):
-            # each agent sees its OWN previous answer, so it can re-solve and
-            # then decide explicitly whether to keep or change it
-            prev = {a.agent_id: (subs[a.agent_id][-1] if subs[a.agent_id] else None)
-                    for a in self.agents}
-            if self.parallel and len(self.agents) > 1:
+            if rnd == 0 and round0 is not None:          # shared first-round answers (trials)
+                outs = [round0[a.agent_id] for a in self.agents]
+            elif self.parallel and len(self.agents) > 1:
                 with ThreadPoolExecutor(max_workers=len(self.agents)) as ex:
-                    outs = list(ex.map(
-                        lambda a: a.propose(problem, transcript, view, own_prev=prev[a.agent_id]),
-                        self.agents))
+                    outs = list(ex.map(lambda a: a.propose(problem, transcript, view), self.agents))
             else:
-                outs = [a.propose(problem, transcript, view, own_prev=prev[a.agent_id])
-                        for a in self.agents]
+                outs = [a.propose(problem, transcript, view) for a in self.agents]
             turns = [(a.agent_id, t) for a, t in zip(self.agents, outs)]
             for aid, t in turns:
                 subs[aid].append(t)
             spk_id, spk = self._pick(turns, rnd)
             transcript.append({"round": rnd, "speaker": spk_id, "answer": spk.answer,
                                "confidence": spk.confidence, "rationale": spk.rationale,
-                               "method": spk.method,
-                               "speaker_prestige": view.get(spk_id, self.ledger.prior)})
+                               "speaker_prestige": view[spk_id]})
 
         final = self._vote([(a.agent_id, subs[a.agent_id][-1]) for a in self.agents])
         res = DebateResult(final, answers_match(final, problem["answer"]), transcript, dict(subs), before)
@@ -684,68 +498,7 @@ class Orchestrator:
 
 
 # ===========================================================================
-# 6. INDEPENDENCE DIAGNOSTICS — are the agents actually thinking separately?
-# ===========================================================================
-
-def cluster_answers(answers) -> list:
-    """Group equivalent answers; returns a list of groups (lists of answers)."""
-    groups = []
-    for a in answers:
-        for g in groups:
-            if answers_match(a, g[0]):
-                g.append(a)
-                break
-        else:
-            groups.append([a])
-    return groups
-
-
-def debate_dynamics(res: DebateResult, truth) -> dict:
-    """Counts for one debate:
-    r0_split     round-0 answers were not unanimous (agents disagreed before seeing anyone)
-    final_split  final answers were not unanimous
-    agent_rounds agent-turns after round 0 (opportunities to switch)
-    switches     turns where an agent's answer differed from its own previous answer
-    herd         switches that landed on an answer already posted in the transcript
-    good / bad   switches wrong->right / right->wrong"""
-    ids = list(res.submissions)
-    r0 = [res.submissions[a][0].answer for a in ids]
-    fin = [res.submissions[a][-1].answer for a in ids]
-    d = {"r0_split": int(len(cluster_answers(r0)) > 1),
-         "final_split": int(len(cluster_answers(fin)) > 1),
-         "agent_rounds": 0, "switches": 0, "herd": 0, "good": 0, "bad": 0}
-    for a in ids:
-        ts = res.submissions[a]
-        for r in range(1, len(ts)):
-            d["agent_rounds"] += 1
-            prev, cur = ts[r - 1].answer, ts[r].answer
-            if answers_match(prev, cur):
-                continue
-            d["switches"] += 1
-            if any(answers_match(cur, t["answer"]) for t in res.transcript[:r]):
-                d["herd"] += 1
-            pv, cv = answers_match(prev, truth), answers_match(cur, truth)
-            if cv and not pv:
-                d["good"] += 1
-            elif pv and not cv:
-                d["bad"] += 1
-    return d
-
-
-def summarize_dynamics(ds: list) -> dict:
-    n = max(1, len(ds))
-    tot = {k: sum(d[k] for d in ds) for k in ("r0_split", "final_split", "agent_rounds",
-                                                "switches", "herd", "good", "bad")}
-    return {"r0_split_rate": tot["r0_split"] / n,
-            "final_split_rate": tot["final_split"] / n,
-            "switch_rate": tot["switches"] / max(1, tot["agent_rounds"]),
-            "herd_share": tot["herd"] / max(1, tot["switches"]),
-            "switch_good": tot["good"],
-            "switch_bad": tot["bad"]}
-
-
-# ===========================================================================
-# 7. EVALUATION — accuracy + stability under three perturbations
+# 5. EVALUATION — accuracy + stability under three perturbations
 # ===========================================================================
 
 @dataclass
@@ -760,18 +513,12 @@ class Metrics:
     prestige_final: dict
     mean_score: dict
     ece: dict
-    dynamics: dict = field(default_factory=dict)
 
     def row(self) -> str:
-        dy = self.dynamics or {}
         return (f"{self.policy:16s} acc={self.accuracy:.2f} flip={self.flip_rate:.2f} "
                 f"C->W={self.flip_c2w:.2f} W->C={self.flip_w2c:.2f} | "
                 f"order={self.flip_by_kind['order']:.2f} drop={self.flip_by_kind['drop']:.2f} "
-                f"fresh={self.flip_by_kind['fresh']:.2f} | "
-                f"r0split={dy.get('r0_split_rate', 0):.2f} "
-                f"finalsplit={dy.get('final_split_rate', 0):.2f} "
-                f"switch={dy.get('switch_rate', 0):.2f} herd={dy.get('herd_share', 0):.2f} "
-                f"good/bad={dy.get('switch_good', 0)}/{dy.get('switch_bad', 0)}")
+                f"fresh={self.flip_by_kind['fresh']:.2f}")
 
 
 def evaluate(make_agents, problems, policy, rounds=3, warmup_frac=0.4, alpha=0.3,
@@ -797,13 +544,10 @@ def evaluate(make_agents, problems, policy, rounds=3, warmup_frac=0.4, alpha=0.3
     n_correct = flips = c2w = w2c = 0
     kind_flips = {"order": 0, "drop": 0, "fresh": 0}
     kind_n = {"order": 0, "drop": 0, "fresh": 0}
-    dyns = []
 
     for i, p in enumerate(test):
         canon = orch.run(p, update_prestige=False)
         n_correct += canon.correct
-        dyn = debate_dynamics(canon, p["answer"])
-        dyns.append(dyn)
 
         # Build the list of (kind, orchestrator) jobs to run — independent of
         # each other (all update_prestige=False), so they run concurrently
@@ -835,7 +579,7 @@ def evaluate(make_agents, problems, policy, rounds=3, warmup_frac=0.4, alpha=0.3
 
         for kind, r in results:
             kind_n[kind] += 1
-            if norm(r.final_answer) != norm(canon.final_answer):
+            if not answers_match(r.final_answer, canon.final_answer):
                 flips += 1
                 kind_flips[kind] += 1
                 if canon.correct and not r.correct:
@@ -846,23 +590,19 @@ def evaluate(make_agents, problems, policy, rounds=3, warmup_frac=0.4, alpha=0.3
         orch.run(p, update_prestige=True)      # learn from this problem
         if verbose:
             print(f"  [{policy}] {i+1}/{len(test)} canon={'OK ' if canon.correct else 'BAD'} "
-                  f"r0split={dyn['r0_split']} switches={dyn['switches']} herd={dyn['herd']} "
                   f"prestige={ {a: round(v,2) for a,v in ledger.snapshot().items()} }", flush=True)
 
     n_pert = sum(kind_n.values())
-    return Metrics(policy=policy, n_test=len(test),
-                   accuracy=n_correct / max(1, len(test)),
-                   flip_rate=flips / max(1, n_pert),
-                   flip_c2w=c2w / max(1, n_pert), flip_w2c=w2c / max(1, n_pert),
-                   flip_by_kind={k: kind_flips[k] / max(1, kind_n[k]) for k in kind_n},
-                   prestige_final=ledger.snapshot(),
-                   mean_score={a: ledger.mean_score(a) for a in ids},
-                   ece={a: ledger.ece(a) for a in ids},
-                   dynamics=summarize_dynamics(dyns))
+    return Metrics(policy, len(test), n_correct / max(1, len(test)),
+                   flips / max(1, n_pert), c2w / max(1, n_pert), w2c / max(1, n_pert),
+                   {k: kind_flips[k] / max(1, kind_n[k]) for k in kind_n},
+                   ledger.snapshot(),
+                   {a: ledger.mean_score(a) for a in ids},
+                   {a: ledger.ece(a) for a in ids})
 
 
 # ===========================================================================
-# 8. PROBLEMS & POPULATIONS
+# 6. PROBLEMS & POPULATIONS
 # ===========================================================================
 
 def synthetic(n, seed):
@@ -919,70 +659,17 @@ def mock_population(seed):
     return make
 
 
-# Default mixed panel: same five personas, spread over two models and two
-# thinking levels so agents differ in real skill, not just in wording.
-# Override with --panel. Check that each model/thinking combo works with
-# `smoke --model ... --thinking ...` before a long run.
-DEFAULT_MIXED_PANEL = ("careful@gemini-3.8-flash:high,"
-                       "fast@gemini-3.1-flash-lite:low,"
-                       "skeptic@gemini-3.8-flash:low,"
-                       "teacher@gemini-3.1-flash-lite:high,"
-                       "contrarian@gemini-3.8-flash:low")
-
-
-def parse_panel(spec: str, default_model, default_thinking, default_temp) -> list:
-    """'persona[@model][:thinking][:temperature],...' -> list of agent configs.
-    thinking is low|high|none; omitted parts fall back to the CLI defaults.
-    A persona used twice gets a numbered id (skeptic, skeptic2, ...)."""
-    out, seen = [], defaultdict(int)
-    for item in [s.strip() for s in spec.split(",") if s.strip()]:
-        parts = item.split(":")
-        persona, _, model = parts[0].partition("@")
-        persona = persona.strip()
-        if persona not in PERSONAS:
-            sys.exit(f"--panel: unknown persona '{persona}'. Choose from {sorted(PERSONAS)}.")
-        thinking = parts[1].strip() if len(parts) > 1 and parts[1].strip() else default_thinking
-        if thinking not in ("low", "high", "none"):
-            sys.exit(f"--panel: thinking must be low|high|none, got '{thinking}' in '{item}'.")
-        try:
-            temp = float(parts[2]) if len(parts) > 2 and parts[2].strip() else default_temp
-        except ValueError:
-            sys.exit(f"--panel: bad temperature in '{item}'.")
-        seen[persona] += 1
-        aid = persona if seen[persona] == 1 else f"{persona}{seen[persona]}"
-        out.append({"agent_id": aid, "persona": persona,
-                    "model": model.strip() or default_model,
-                    "thinking": None if thinking == "none" else thinking,
-                    "temperature": temp})
-    if len(out) < 2:
-        sys.exit("--panel needs at least two agents.")
-    return out
-
-
 def gemini_population(a):
-    if a.panel:
-        spec = a.panel
-    elif a.population == "mixed":
-        spec = DEFAULT_MIXED_PANEL
-    else:
-        spec = ",".join(PERSONAS)          # every persona on --model / --thinking
-    cfgs = parse_panel(spec, a.model, a.thinking, a.temperature)
-
+    tl = None if a.thinking == "none" else a.thinking
     def make():
-        return [GeminiAgent(c["agent_id"], c["persona"], model=c["model"],
-                            temperature=c["temperature"], thinking_level=c["thinking"],
-                            log_path=a.log, api=a.api, board=a.board)
-                for c in cfgs]
+        return [GeminiAgent(n, n, model=a.model, temperature=a.temperature,
+                            thinking_level=tl, log_path=a.log, api=a.api)
+                for n in PERSONAS]
     return make
 
 
-def describe_panel(agents) -> str:
-    return "\n".join(f"  {ag.agent_id:12s} persona={ag.persona:10s} model={ag.model} "
-                     f"thinking={ag.thinking_level} temp={ag.temperature}" for ag in agents)
-
-
 # ===========================================================================
-# 9. COMMANDS
+# 7. COMMANDS
 # ===========================================================================
 
 def cmd_smoke(a):
@@ -994,42 +681,18 @@ def cmd_smoke(a):
         try:
             ag = GeminiAgent("careful", "careful", model=a.model, temperature=a.temperature,
                              thinking_level=(None if a.thinking == "none" else a.thinking),
-                             log_path=None, api=api, max_retries=1, board=a.board)
+                             log_path=None, api=api, max_retries=1)
             t = ag.propose(p, [], {"careful": 0.5})
             ok = "CORRECT" if norm(t.answer) == "391" else "WRONG"
-            print(f"SUCCESS [{ok}] answer={t.answer} confidence={t.confidence:.2f} method={t.method}")
+            print(f"SUCCESS [{ok}] answer={t.answer} confidence={t.confidence:.2f}")
             print(f"        rationale: {t.rationale[:100]}")
         except Exception:
             traceback.print_exc()
     print("\nIf legacy works and interactions doesn't, just use --api legacy (the default).")
 
 
-def cmd_prompts(a):
-    """Print the system and user prompts each persona would see. No API calls."""
-    p = {"question": "How many positive divisors does 36 have?", "answer": "9"}
-    prestige = {k: 0.5 for k in PERSONAS}
-    prev = AgentTurn(method="prime factorization", rationale="36 = 2^2 * 3^2, so (2+1)(2+1).",
-                     answer="9", changed_answer=False, change_reason="",
-                     key_uncertainty="none", confidence=0.95)
-    transcript = [{"round": 0, "speaker": "fast", "answer": "8", "confidence": 0.9,
-                   "rationale": "Listed divisors quickly.", "method": "listing",
-                   "speaker_prestige": 0.5}]
-    keys = [a.persona] if a.persona else list(PERSONAS)
-    for k in keys:
-        print("=" * 78)
-        print(f"SYSTEM ({k}, board={a.board})\n")
-        print(render_system(k, a.board))
-        print("-" * 78)
-        print("USER, round 0\n")
-        print(render_user(k, p, [], prestige, None, a.board))
-        print("-" * 78)
-        print("USER, round 1\n")
-        print(render_user(k, p, transcript, prestige, prev, a.board))
-
-
 def cmd_mock(a):
-    print(f"{'policy':16s}  acc  flip  C->W  W->C | order  drop fresh | r0split switch herd"
-          f"   (mean of {a.seeds} seeds)")
+    print(f"{'policy':16s}  acc  flip  C->W  W->C | order  drop fresh   (mean of {a.seeds} seeds)")
     for pol in a.policies.split(","):
         ms = [evaluate(mock_population(s), synthetic(a.n, s), pol, a.rounds, alpha=a.alpha,
                        rule=a.rule, stake=a.stake, tau=a.tau, seed=s) for s in range(a.seeds)]
@@ -1037,10 +700,7 @@ def cmd_mock(a):
         print(f"{pol:16s} {avg(lambda m: m.accuracy):.2f}  {avg(lambda m: m.flip_rate):.2f}  "
               f"{avg(lambda m: m.flip_c2w):.2f}  {avg(lambda m: m.flip_w2c):.2f} | "
               f"{avg(lambda m: m.flip_by_kind['order']):.2f}  {avg(lambda m: m.flip_by_kind['drop']):.2f}  "
-              f"{avg(lambda m: m.flip_by_kind['fresh']):.2f} | "
-              f"{avg(lambda m: m.dynamics['r0_split_rate']):.2f}    "
-              f"{avg(lambda m: m.dynamics['switch_rate']):.2f}   "
-              f"{avg(lambda m: m.dynamics['herd_share']):.2f}")
+              f"{avg(lambda m: m.flip_by_kind['fresh']):.2f}")
         print("   prestige:", {k: round(v, 2) for k, v in ms[-1].prestige_final.items()})
 
 
@@ -1049,18 +709,14 @@ def _levels(a):
 
 
 def cmd_calib(a):
-    """MILESTONE 1: single agent, no debate. Does stated confidence predict correctness?
-    Also the cheapest test of persona independence: how often do round-0 answers differ?"""
+    """MILESTONE 1: single agent, no debate. Does stated confidence predict correctness?"""
     probs = load_jsonl(a.problems, a.n, levels=_levels(a)) if a.problems else synthetic(a.n, 0)
     agents = gemini_population(a)()
-    ids = [x.agent_id for x in agents]
-    led = PrestigeLedger(ids)
+    led = PrestigeLedger([x.agent_id for x in agents])
     lvl_str = f"levels={sorted(_levels(a))}" if a.level else "levels=all"
     print(f"Running {len(probs)} problems x {len(agents)} agents "
           f"({len(probs)*len(agents)} calls, {a.api or 'legacy'} transport, "
-          f"board={a.board}, {lvl_str})\n{describe_panel(agents)}\n")
-    splits = 0
-    agree = defaultdict(int)          # (agent_i, agent_j) -> #problems with equivalent answers
+          f"thinking={a.thinking}, {lvl_str})\n")
     for i, p in enumerate(probs):
         with ThreadPoolExecutor(max_workers=len(agents)) as ex:
             turns = list(ex.map(lambda ag: ag.propose(p, [], led.snapshot()), agents))
@@ -1069,47 +725,22 @@ def cmd_calib(a):
             ok = answers_match(t.answer, p["answer"])
             led.update(ag.agent_id, t.confidence, ok)
             marks.append(f"{ag.agent_id[:4]}{'+' if ok else '-'}{t.confidence:.2f}")
-        answers = [t.answer for t in turns]
-        split = len(cluster_answers(answers)) > 1
-        splits += split
-        for x in range(len(ids)):
-            for y in range(x + 1, len(ids)):
-                if answers_match(answers[x], answers[y]):
-                    agree[(ids[x], ids[y])] += 1
-        print(f"[{i+1}/{len(probs)}] {'SPLIT' if split else '     '} truth={p['answer']:<8} "
-              + "  ".join(marks), flush=True)
+        print(f"[{i+1}/{len(probs)}] truth={p['answer']:<8} " + "  ".join(marks), flush=True)
 
-    print(f"\n{'agent':12s} {'acc':>5s} {'meanconf':>9s} {'1-brier':>8s} {'ECE':>5s}")
+    print(f"\n{'agent':12s} {'acc':>5s} {'meanconf':>9s} {'brier':>6s} {'ECE':>5s}")
     for ag in agents:
         r = led.records[ag.agent_id]
         acc = sum(y for _, y, _ in r) / len(r)
         mc = sum(c for c, _, _ in r) / len(r)
-        print(f"{ag.agent_id:12s} {acc:5.2f} {mc:9.2f} {led.mean_score(ag.agent_id):8.2f} "
+        print(f"{ag.agent_id:12s} {acc:5.2f} {mc:9.2f} {led.mean_score(ag.agent_id):6.2f} "
               f"{led.ece(ag.agent_id):5.2f}")
-
-    n = max(1, len(probs))
-    print(f"\nIndependence: agents disagreed on {splits}/{len(probs)} problems "
-          f"({splits / n:.0%}).")
-    print("Pairwise agreement (share of problems with equivalent answers):")
-    print(" " * 12 + "".join(f"{x[:6]:>8s}" for x in ids))
-    for x in ids:
-        row = []
-        for y in ids:
-            if x == y:
-                row.append(f"{'-':>8s}")
-            else:
-                k = (x, y) if (x, y) in agree else (y, x)
-                row.append(f"{agree.get(k, 0) / n:8.2f}")
-        print(f"{x[:12]:12s}" + "".join(row))
     print("\nRead this: if acc is ~1.00 everywhere, the problems are too easy to show\n"
           "anything — use harder ones. If acc is far below meanconf everywhere (high ECE),\n"
-          "confidence isn't carrying signal; fix elicitation before running debates.\n"
-          "If agents almost never disagree, the panel has nothing for a policy to decide.")
+          "confidence isn't carrying signal; fix elicitation before running debates.")
 
 
 def cmd_debate(a):
     probs = load_jsonl(a.problems, a.n, levels=_levels(a)) if a.problems else synthetic(a.n, 0)
-    print("Panel:\n" + describe_panel(gemini_population(a)()) + f"\nboard={a.board}")
     ms = []
     for pol in a.policies.split(","):
         print(f"\n=== {pol}")
@@ -1117,7 +748,7 @@ def cmd_debate(a):
             perts = tuple(a.perturbations.split(","))
             m = evaluate(gemini_population(a), probs, pol, a.rounds, alpha=a.alpha,
                          rule=a.rule, stake=a.stake, tau=a.tau, verbose=True,
-                         perturbations=perts)
+                         perturbations=perts, warmup_frac=a.warmup_frac)
             print(m.row())
             ms.append(m)
         except Exception as e:
@@ -1131,15 +762,315 @@ def cmd_debate(a):
     print("\nwrote", a.out, f"({len(ms)}/{len(a.policies.split(','))} policies completed)")
 
 
+# ===========================================================================
+# 8. TRIALS — multi-seed, no warmup, parallel across problems
+# ===========================================================================
+#
+# `debate` learns prestige problem-by-problem, so problems must run one after
+# another. `trials` instead computes prestige from each agent's independent
+# FIRST-ROUND answer (given before it has seen anyone else), which makes every
+# debate independent of every other:
+#   phase A  first-round answers for all problems         (parallel)
+#   phase B  prestige-before-problem-i, computed offline from problems < i
+#   phase C  rounds 2..N of every (policy, problem) debate  (parallel)
+# No warmup: problem i is always scored with prestige learned from problems
+# before it, never from itself. All policies share the same first-round
+# answers, so the comparison is paired. Everything is appended to a JSONL store
+# (resumable, regradable) and summarized by `report`.
+
+TRIAL_POLICIES = ("prestige_x_conf", "conf_only", "prestige_only", "round_robin")
+
+
+def _qid(problem):
+    import hashlib
+    return hashlib.md5(problem["question"].encode()).hexdigest()[:10]
+
+
+class _Store:
+    """Append-only JSONL: a crash or Ctrl-C loses nothing, and reruns resume."""
+    def __init__(self, path):
+        self.path, self.lock, self.rows = path, threading.Lock(), []
+        if os.path.exists(path):
+            with open(path) as f:
+                self.rows = [json.loads(line) for line in f if line.strip()]
+
+    def add(self, row):
+        with self.lock:
+            self.rows.append(row)
+            with open(self.path, "a") as f:
+                f.write(json.dumps(row) + "\n")
+
+
+def prestige_path(first_round, ids, mode="shrunk", alpha=0.3, prior=0.5, k=5, rule="brier"):
+    """first_round: per problem, in order, {agent: (confidence, correct)}.
+    Returns the prestige of every agent BEFORE each problem (learned only from
+    earlier problems). mode 'shrunk' = running mean pulled toward the prior with
+    weight k; 'ema' = exponential average, one update per problem."""
+    score = RULES[rule]
+    v = {a: prior for a in ids}
+    tot = {a: 0.0 for a in ids}
+    path = []
+    for n, r in enumerate(first_round, 1):
+        path.append(dict(v))
+        for a in ids:
+            s = score(*r[a])
+            if mode == "ema":
+                v[a] = (1 - alpha) * v[a] + alpha * s
+            else:
+                tot[a] += s
+                v[a] = (tot[a] + k * prior) / (n + k)
+    return path
+
+
+def _trial_problems(a, seed):
+    if a.disjoint:
+        pool = load_jsonl(a.problems, None, levels=_levels(a)) if a.problems else synthetic(a.n * (seed + 1), 0)
+        chunk = pool[seed * a.n:(seed + 1) * a.n]
+        if len(chunk) < a.n:
+            sys.exit(f"--disjoint needs {a.n * (seed + 1)} problems; {a.problems} only has {len(pool)}.")
+        return chunk
+    base = load_jsonl(a.problems, a.n, levels=_levels(a)) if a.problems else synthetic(a.n, 0)
+    if seed:                                   # seed 0 keeps the standard order
+        base = base[:]
+        random.Random(seed).shuffle(base)
+    return base
+
+
+def _run_pool(workers, jobs, label):
+    """Run zero-arg callables concurrently; a failed task is reported, not fatal."""
+    from concurrent.futures import as_completed
+    if not jobs:
+        return 0
+    failed, t0 = 0, time.time()
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futs = [ex.submit(j) for j in jobs]
+        for k, f in enumerate(as_completed(futs), 1):
+            try:
+                f.result()
+            except Exception as e:
+                failed += 1
+                print(f"  !! {label} task failed: {type(e).__name__}: {str(e)[:120]}", flush=True)
+            if k % max(1, len(jobs) // 10) == 0 or k == len(jobs):
+                print(f"  [{label}] {k}/{len(jobs)} done, {failed} failed, {time.time() - t0:.0f}s", flush=True)
+    except KeyboardInterrupt:
+        print("\nInterrupted: stopped. Debates not yet saved will be redone. "
+              "Rerun the same command to resume.", flush=True)
+        ex.shutdown(wait=False, cancel_futures=True)
+        os._exit(130)
+    ex.shutdown(wait=True)
+    return failed
+
+
+def cmd_trials(a):
+    pols = a.policies.split(",")
+    if a.policies == ",".join(POLICIES):
+        pols = ["round_robin", "prestige_x_conf"]          # default: the main comparison
+    bad = [p for p in pols if p not in TRIAL_POLICIES]
+    if bad:
+        sys.exit(f"trials supports {TRIAL_POLICIES}; {bad} need a warmup phase (use `debate`).")
+    if not a.mock and not a.model:
+        sys.exit("trials: pass --model explicitly (e.g. --model gemini-3.1-flash-lite).")
+    store = _Store(a.store)
+    cfg = {"model": "mock" if a.mock else a.model, "problems": a.problems, "n": a.n, "level": a.level,
+           "rounds": a.rounds, "temperature": a.temperature, "thinking": a.thinking,
+           "prestige_mode": a.prestige_mode, "alpha": a.alpha, "prior_strength": a.prior_strength,
+           "rule": a.rule, "tau": a.tau, "disjoint": a.disjoint}
+    old = [r for r in store.rows if r["kind"] == "config"]
+    if old and old[0]["cfg"] != cfg:
+        diff = {k: (old[0]["cfg"].get(k), v) for k, v in cfg.items() if old[0]["cfg"].get(k) != v}
+        sys.exit(f"{a.store} was started with different settings {diff} (stored, now).\n"
+                 f"Use a new --store file, or rerun with the original settings to resume.")
+    if not old:
+        store.add({"kind": "config", "cfg": cfg, "started": time.time()})
+
+    later = max(0, a.rounds - 1)
+    per_seed = a.n * 5 + len(pols) * a.n * 2 * later * 5
+    total = a.seeds * per_seed
+    have = sum(r["kind"] == "r0" for r in store.rows) * 5 + \
+           sum(r["kind"] == "debate" for r in store.rows) * 2 * later * 5
+    left = max(0, total - have)
+    print(f"model {cfg['model']} | {a.seeds} seed(s) x {a.n} problems | policies {pols} | {a.rounds} rounds | "
+          f"prestige={a.prestige_mode} | workers {a.workers} | stagger {a.stagger}s")
+    print(f"calls: {per_seed}/seed, {total} total, ~{left} still to make "
+          f"(~${left * a.price_per_call:.0f} at ~${a.price_per_call}/call, a rough guess -- check your billing; at least {left * a.stagger / 60:.0f} min at this stagger)")
+    print(f"results -> {a.store} (append-only; rerun the same command to resume)\n")
+    if a.dry_run:
+        return
+
+    for seed in range(a.seeds):
+        probs = _trial_problems(a, seed)
+        agents = mock_population(seed)() if a.mock else gemini_population(a)()
+        ids = [x.agent_id for x in agents]
+        qids = [_qid(p) for p in probs]
+        print(f"=== seed {seed}")
+
+        def do_r0(i, probs=probs, agents=agents, qids=qids, seed=seed):
+            p = probs[i]
+            with ThreadPoolExecutor(max_workers=len(agents)) as ex:
+                outs = list(ex.map(lambda ag: ag.propose(p, [], None), agents))
+            store.add({"kind": "r0", "seed": seed, "qid": qids[i], "pid": i, "truth": p["answer"],
+                       "level": p.get("level"),
+                       "turns": {ag.agent_id: t.model_dump() for ag, t in zip(agents, outs)}})
+
+        for attempt in range(3):                      # automatic retry passes for failed tasks
+            done = {r["qid"] for r in store.rows if r["kind"] == "r0" and r["seed"] == seed}
+            jobs = [(lambda i=i: do_r0(i)) for i in range(len(probs)) if qids[i] not in done]
+            if not _run_pool(a.workers, jobs, f"seed {seed} round 1" + (f" retry {attempt}" if attempt else "")):
+                break
+        r0 = {r["qid"]: r for r in store.rows if r["kind"] == "r0" and r["seed"] == seed}
+        missing = [i for i in range(len(probs)) if qids[i] not in r0]
+        if missing:
+            sys.exit(f"{len(missing)} problems still lack first-round answers after 3 passes (API trouble). "
+                     f"Rerun the same command later to resume; nothing is lost.")
+
+        fr = [{aid: (r0[qids[i]]["turns"][aid]["confidence"],
+                     answers_match(r0[qids[i]]["turns"][aid]["answer"], probs[i]["answer"])) for aid in ids}
+              for i in range(len(probs))]
+        path = prestige_path(fr, ids, a.prestige_mode, a.alpha, k=a.prior_strength, rule=a.rule)
+
+        def do_debate(pol, i, probs=probs, agents=agents, ids=ids, qids=qids, path=path, r0=r0, seed=seed):
+            p, qid = probs[i], qids[i]
+            led = PrestigeLedger(ids, rule=a.rule, values=dict(path[i]), frozen=True)
+            first = {aid: AgentTurn(**r0[qid]["turns"][aid]) for aid in ids}
+            mk = lambda ags, tag: Orchestrator(ags, led, pol, a.rounds, tau=a.tau, random_ties=True,
+                                               seed=f"{seed}:{qid}:{tag}")
+            perm = agents[:]
+            random.Random(f"{seed}:{qid}").shuffle(perm)
+            with ThreadPoolExecutor(max_workers=2) as ex:      # canonical + reordered run side by side
+                f_canon = ex.submit(mk(agents, "canon").run, p, False, first)
+                f_pert = ex.submit(mk(perm, "order").run, p, False, first)
+                canon, pert = f_canon.result(), f_pert.result()
+            store.add({"kind": "debate", "seed": seed, "policy": pol, "qid": qid, "pid": i,
+                       "truth": p["answer"], "prestige": path[i],
+                       "canon": {"final": canon.final_answer,
+                                 "speakers": [t["speaker"] for t in canon.transcript],
+                                 "last": {k: v[-1].answer for k, v in canon.submissions.items()}},
+                       "order": {"final": pert.final_answer, "perm": [x.agent_id for x in perm],
+                                 "speakers": [t["speaker"] for t in pert.transcript]}})
+
+        for attempt in range(3):
+            done = {(r["policy"], r["qid"]) for r in store.rows if r["kind"] == "debate" and r["seed"] == seed}
+            jobs = [(lambda pol=pol, i=i: do_debate(pol, i)) for i in range(len(probs)) for pol in pols
+                    if (pol, qids[i]) not in done]
+            if not _run_pool(a.workers, jobs, f"seed {seed} debates" + (f" retry {attempt}" if attempt else "")):
+                break
+        else:
+            print(f"WARNING: seed {seed} still has failed debates after 3 passes; "
+                  f"rerun the same command later to fill them in.", flush=True)
+
+    report_trials(store.rows, pols, out=a.out)
+
+
+def report_trials(rows, pols=None, ref="round_robin", B=2000, out=None):
+    """Summaries and paired comparisons from a trials store. Correctness is
+    recomputed from stored answers with the CURRENT grader, so fixing the grader
+    never requires rerunning the model."""
+    import statistics as st
+    r0 = {(r["seed"], r["qid"]): r for r in rows if r["kind"] == "r0"}
+    deb = defaultdict(dict)
+    for r in rows:
+        if r["kind"] == "debate":
+            deb[r["policy"]][(r["seed"], r["qid"])] = r
+    pols = [p for p in (pols or sorted(deb)) if p in deb]
+    if not pols:
+        print("No completed debates in the store yet."); return
+    seeds = sorted({s for s, _ in r0})
+    npid = max(r["pid"] for r in r0.values()) + 1
+
+    def derive(rec):
+        t = rec["truth"]
+        acc = answers_match(rec["canon"]["final"], t)
+        pok = answers_match(rec["order"]["final"], t)
+        flip = not answers_match(rec["canon"]["final"], rec["order"]["final"])
+        turns = r0[(rec["seed"], rec["qid"])]["turns"]
+        k = sum(answers_match(v["answer"], t) for v in turns.values())
+        return dict(acc=float(acc), flip=float(flip), c2w=float(flip and acc and not pok),
+                    w2c=float(flip and (not acc) and pok), contested=0 < k < len(turns),
+                    late=rec["pid"] >= npid // 2)
+
+    D = {p: {key: derive(rec) for key, rec in recs.items()} for p, recs in deb.items() if p in pols}
+    per_seed_n = {sd: sum(1 for s, _ in r0 if s == sd) for sd in seeds}
+    print("completeness (debates done / problems with round-1 answers):")
+    for sd in seeds:
+        print(f"  seed {sd}: " + ", ".join(f"{p} {sum(1 for s, _ in D[p] if s == sd)}/{per_seed_n[sd]}" for p in pols))
+    mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
+
+    def by_seed(p, field, sel=lambda d: True):
+        return [mean([d[field] for (s, _), d in D[p].items() if s == sd and sel(d)]) for sd in seeds]
+
+    def fmt(xs):
+        xs = [x for x in xs if x == x]
+        if not xs: return "   n/a"
+        sd = f" +-{st.stdev(xs):.3f}" if len(xs) > 1 else ""
+        return f"{mean(xs):.3f}{sd}"
+
+    print(f"\n{len(seeds)} seed(s); mean +- sd across seeds; every problem scored (no warmup)\n")
+    print(f"{'':30s}{'accuracy':>16s}{'flip':>16s}{'C->W':>14s}{'W->C':>14s}{'acc 2nd half':>16s}{'acc contested':>16s}")
+    base_single, base_maj = [], []
+    for sd in seeds:
+        single, maj = [], []
+        for (s, qid), r in r0.items():
+            if s != sd: continue
+            t = r["truth"]
+            oks = [answers_match(v["answer"], t) for v in r["turns"].values()]
+            single.append(mean([float(o) for o in oks]))
+            groups = []
+            for v in r["turns"].values():
+                for g in groups:
+                    if answers_match(v["answer"], g[0]):
+                        g[1] += 1; break
+                else:
+                    groups.append([v["answer"], 1])
+            maj.append(float(answers_match(max(groups, key=lambda g: g[1])[0], t)))
+        base_single.append(mean(single)); base_maj.append(mean(maj))
+    print(f"{'single agent (round 1)':30s}{fmt(base_single):>16s}")
+    print(f"{'majority vote, no debate':30s}{fmt(base_maj):>16s}")
+    summary = {"seeds": seeds, "baseline_single": base_single, "baseline_majority": base_maj, "policies": {}}
+    for p in pols:
+        cols = [by_seed(p, "acc"), by_seed(p, "flip"), by_seed(p, "c2w"), by_seed(p, "w2c"),
+                by_seed(p, "acc", lambda d: d["late"]), by_seed(p, "acc", lambda d: d["contested"])]
+        print(f"{p:30s}" + "".join(f"{fmt(c):>{w}s}" for c, w in zip(cols, [16, 16, 14, 14, 16, 16])))
+        summary["policies"][p] = dict(zip(["acc", "flip", "c2w", "w2c", "acc_late", "acc_contested"], cols))
+
+    if ref in pols and len(pols) > 1:
+        print(f"\npaired differences vs {ref} (95% bootstrap CI over problems; problems shared across seeds are resampled together)")
+        rng = random.Random(0)
+        for p in pols:
+            if p == ref: continue
+            keys = sorted(set(D[p]) & set(D[ref]))
+            qs = sorted({q for _, q in keys})
+            row = f"  {p:18s}"
+            for field in ["acc", "flip", "c2w"]:
+                per_q = {q: mean([D[p][(s, q)][field] - D[ref][(s, q)][field] for s in seeds if (s, q) in D[p] and (s, q) in D[ref]])
+                         for q in qs}
+                vals = list(per_q.values())
+                boots = sorted(mean(rng.choices(vals, k=len(vals))) for _ in range(B))
+                lo, hi = boots[int(.025 * B)], boots[int(.975 * B) - 1]
+                row += f"  d{field} {mean(vals):+.3f} [{lo:+.3f}, {hi:+.3f}]"
+                summary["policies"][p][f"d_{field}_vs_{ref}"] = [mean(vals), lo, hi]
+            print(row)
+        print("  (an interval containing 0 means the difference is not distinguishable from noise)")
+    if out:
+        with open(out, "w") as f:
+            json.dump(summary, f, indent=2)
+        print("\nwrote", out)
+
+
+def cmd_report(a):
+    store = _Store(a.store)
+    report_trials(store.rows, a.policies.split(",") if a.policies != ",".join(POLICIES) else None, out=a.out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["smoke", "prompts", "mock", "calib", "debate"])
+    ap.add_argument("cmd", choices=["smoke", "mock", "calib", "debate", "trials", "report"])
     ap.add_argument("--problems", default=None, help="JSONL file; omit for synthetic arithmetic")
     ap.add_argument("--level", default=None, help="MATH levels to keep, e.g. '4,5' (comma-separated)")
     ap.add_argument("--n", type=int, default=60)
     ap.add_argument("--rounds", type=int, default=3)
-    ap.add_argument("--seeds", type=int, default=5, help="mock only")
+    ap.add_argument("--seeds", type=int, default=None, help="repeats: mock (default 5) / trials (default 3)")
     ap.add_argument("--alpha", type=float, default=0.3, help="prestige EMA rate")
     ap.add_argument("--rule", default="brier", choices=["brier", "log"])
     ap.add_argument("--stake", action="store_true", help="scale prestige update by stated confidence")
@@ -1151,14 +1082,6 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--thinking", default="low", choices=["low", "high", "none"],
                     help="default low; 'none' disables the flag entirely")
-    ap.add_argument("--population", default="same", choices=["same", "mixed"],
-                    help="same: every persona on --model/--thinking. mixed: DEFAULT_MIXED_PANEL")
-    ap.add_argument("--panel", default=None,
-                    help="custom panel, overrides --population: "
-                         "'persona[@model][:thinking][:temp],...'")
-    ap.add_argument("--board", default="full", choices=["full", "blind"],
-                    help="blind hides other agents' confidence and prestige from the transcript")
-    ap.add_argument("--persona", default=None, help="prompts only: show one persona")
     ap.add_argument("--log", default="calls.jsonl")
     ap.add_argument("--out", default="results.json")
     ap.add_argument("--stagger", type=float, default=0.3,
@@ -1167,10 +1090,22 @@ def main():
                     help="which stability checks to run (comma-sep, subset of order,drop,fresh). "
                         "'drop' is 5x cost (one run per agent removed) — drop it for a faster/"
                         "cheaper first pass, e.g. --perturbations order,fresh")
+    ap.add_argument("--warmup-frac", type=float, default=0.4, help="debate: share of problems used as warmup")
+    ap.add_argument("--workers", type=int, default=6, help="trials: debates run concurrently")
+    ap.add_argument("--store", default="trials.jsonl", help="trials/report: append-only results file")
+    ap.add_argument("--prestige-mode", default="shrunk", choices=["shrunk", "ema"],
+                    help="trials: 'shrunk' = running mean pulled toward the prior; 'ema' uses --alpha")
+    ap.add_argument("--prior-strength", type=float, default=5.0, help="trials: pseudo-problems of prior in 'shrunk'")
+    ap.add_argument("--disjoint", action="store_true", help="trials: a different block of --n problems per seed")
+    ap.add_argument("--mock", action="store_true", help="trials: simulated agents, no API calls")
+    ap.add_argument("--price-per-call", type=float, default=0.002, help="trials: $ per call, for the estimate only")
+    ap.add_argument("--dry-run", action="store_true", help="trials: print the plan and cost, make no calls")
     a = ap.parse_args()
+    if a.seeds is None:
+        a.seeds = 3 if a.cmd == "trials" else 5
     _RATE_LIMITER.min_interval = a.stagger
-    {"smoke": cmd_smoke, "prompts": cmd_prompts, "mock": cmd_mock,
-     "calib": cmd_calib, "debate": cmd_debate}[a.cmd](a)
+    {"smoke": cmd_smoke, "mock": cmd_mock, "calib": cmd_calib, "debate": cmd_debate,
+     "trials": cmd_trials, "report": cmd_report}[a.cmd](a)
 
 
 if __name__ == "__main__":
