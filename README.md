@@ -52,9 +52,12 @@ python3 mad_gemini.py mock --n 80 --seeds 8        # simulated agents, no API ca
 python3 mad_gemini.py smoke                         # one real call, full errors
 python3 mad_gemini.py calib --problems math.jsonl --n 100 --model gemini-3.1-flash-lite
 date +%s    # note the timestamp so this run's calls can be isolated later
-python3 mad_gemini.py debate --problems math.jsonl --n 100 --model gemini-3.1-flash-lite \
-    --policies round_robin,prestige_x_conf --rounds 3 --perturbations order --stagger 1.0
+python3 mad_gemini.py trials --problems math.jsonl --n 100 --seeds 3 --model gemini-3.1-flash-lite \
+    --policies round_robin,prestige_x_conf --stagger 0.3 --workers 6 --store trials.jsonl --dry-run
+python3 mad_gemini.py report --store trials.jsonl   # regrade + summarize, no API calls
 ```
+
+`trials` is resumable: rerun the same command after a crash or Ctrl-C.
 
 Problem files are JSONL: `{"question", "answer"}` or MATH-style
 `{"problem", "solution", "level"}` (the `\boxed{}` answer is extracted;
@@ -67,48 +70,37 @@ analyze that log:
 
 ## Findings so far
 
-**Confidence is only informative in a narrow difficulty band.** gemini-3.8-flash
-saturates MATH (90–100%, confidence pinned at 0.99). The lite models collapse on
-AIME and MathArena (7–27%). The usable pairing is **gemini-3.1-flash-lite on
-MATH**: solo accuracy 0.77, mean confidence 0.97. Confidence ranks answers
-correctly (0.99 → 83% right, 0.95 → 62%, ≤0.90 → 37%) but is 15–30 points too
-high. 85% of wrong answers are stated at ≥0.95 confidence.
+**Main result (`trials`: gemini-3.1-flash-lite, 100 MATH problems, 3 seeds, 3 rounds, no warmup).**
+Mean ± SD across seeds; results in `results/`.
 
-**Debate results (gemini-3.1-flash-lite, MATH, 3 rounds, order perturbation):**
+| Method | Accuracy | Flip | C→W |
+|---|---|---|---|
+| Single agent (round 1) | 81.1 ± 2.3% | – | – |
+| Majority vote, no debate | 85.3 ± 2.3% | – | – |
+| Round-robin debate | **88.3 ± 1.5%** | 9.7 ± 2.5% | 4.3 ± 2.1% |
+| Prestige × confidence | 86.0 ± 1.7% | **6.7 ± 2.3%** | **2.0 ± 2.6%** |
 
-| Run (test problems) | Policy | Accuracy | Flip | C→W |
-|---|---|---|---|---|
-| n=30 (18) | round_robin / prestige_x_conf | 0.78 / 0.89 | 0.17 / 0.06 | 0 / 0 |
-| n=50 (30) | round_robin / prestige_x_conf | 0.80 / 0.77 | 0.10 / 0.10 | 0 / 0 |
-| **n=100 (60)** | round_robin / prestige_x_conf | **0.767 / 0.767** | **0.13 / 0.22** | **0.02 / 0.08** |
-| solo, no debate (100) | mean of 5 agents | 0.77 | – | – |
+Paired differences (prestige × confidence − round robin, 95% bootstrap CI over problems):
+accuracy −2.3 [−5.7, +0.3], flip −3.0 [−6.7, +0.3], C→W −2.3 [−5.3, +0.3]. None significant.
 
-No detectable difference between the two policies (n=100 flip rate p=0.34,
-C→W p=0.21, Fisher exact). Debate also doesn't beat one agent answering alone.
-A small earlier AIME run (n=5) looked favorable but had only 3 test problems.
+- **Debate helps:** round robin beats majority vote by 3 points and one agent by 7.
+- **Prestige × confidence doesn't beat round robin.** It trends more stable but less accurate,
+  most visibly on contested problems (73.9% vs 81.6%).
+- **Likely reason:** with near-identical agents and confidence pinned near 0.99, it hands the
+  floor to the confident majority every round, so a correct dissenter is rarely heard.
+- In the mock test with genuinely different agents, prestige × confidence does win.
 
-**Why prestige has nothing to work with in this setup:**
-- **Prestige tracks only the last problem.** It updates once per round (3× per
-  problem) at alpha 0.3, so about 66% of the weight is on the most recent problem.
-- **Agents are graded together.** By round 3 they usually agree, so they're right
-  or wrong together and prestige stays nearly identical across agents.
-- **Confidence is stuck at the top.** Most answers are 0.99; within a disputed
-  problem, right and wrong agents tie on confidence 61% of the time.
-- **The agents are one model.** Their true accuracy spans only 0.72–0.80, so there
-  is little real reliability difference to learn. In the mock test with genuinely
-  different agents, prestige × confidence does win.
-
-**Grading caveat:** runs up to tag `v0.1-baseline` used an answer grader that
-missed some equivalent forms (`\frac 34`, vectors vs. tuples, base subscripts).
-It's fixed now; earlier accuracies may be understated by up to ~7 points and
-should be regraded from `calls.jsonl`.
+`trials` scores prestige from each agent's independent first-round answer (running mean,
+prior 0.5 worth 5 problems), so every problem is scored and debates run in parallel. Both
+policies share the same first-round answers (paired). Earlier single-run results (76.7% for
+both policies, old grader, 40% warmup) are superseded.
 
 ## Next steps
 
+- Check the mechanism from stored data: speaker agreement with the round-1 majority per policy.
+- Sample the speaker by weight (`--tau`) instead of always picking the top one.
 - Mixed-skill population (different models or thinking levels) so reliability actually varies.
-- Score prestige once per problem from round-1 (independent) answers; slower EMA (alpha ≈ 0.05).
-- Random tie-breaking for speaker choice; finer-grained confidence elicitation.
-- Credit for influence, not just calibration ("right and heard" vs. "right but ignored").
+- More problems rather than more seeds: the paired CI is about ±3 points at n=100.
 
 ## Known issues
 
