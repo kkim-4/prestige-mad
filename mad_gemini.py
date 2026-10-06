@@ -427,9 +427,12 @@ class Orchestrator:
     final answer is a weighted vote over each agent's last submission."""
 
     def __init__(self, agents, ledger: PrestigeLedger, policy="prestige_x_conf", rounds=3,
-                 tau=None, scaler: PlattScaler = None, parallel=True, seed=0, random_ties=False):
+                 tau=None, scaler: PlattScaler = None, parallel=True, seed=0, random_ties=False,
+                 stop_unanimous=False, carry=None):
         self.agents, self.ledger, self.policy, self.rounds = agents, ledger, policy, rounds
         self.random_ties = random_ties       # True: equal weights -> random speaker, not list order
+        self.stop_unanimous = stop_unanimous # True: end the debate as soon as every agent agrees
+        self.carry = carry                   # {agent: [its round-1 sample answers]} -> later-round confidence
         self.tau = tau                       # None -> argmax speaker; float -> softmax
         self.scaler = scaler or PlattScaler()
         self.parallel = parallel
@@ -463,9 +466,20 @@ class Orchestrator:
                     outs = list(ex.map(lambda a: a.propose(problem, transcript, view), self.agents))
             else:
                 outs = [a.propose(problem, transcript, view) for a in self.agents]
+            if rnd > 0 and self.carry:
+                # Later-round confidence = share of the agent's own independent round-1
+                # samples that reached the answer it now gives. An agent that merely
+                # adopted someone else's answer gets low confidence for it.
+                outs = [t.model_copy(update={"confidence": min(0.99, max(0.01,
+                        sum(answers_match(x, t.answer) for x in self.carry[a.agent_id]) / len(self.carry[a.agent_id])))})
+                        for a, t in zip(self.agents, outs)]
             turns = [(a.agent_id, t) for a, t in zip(self.agents, outs)]
             for aid, t in turns:
                 subs[aid].append(t)
+            if self.stop_unanimous and all(answers_match(t.answer, turns[0][1].answer) for _, t in turns):
+                break                                    # everyone agrees: nothing left to debate
+            if rnd == self.rounds - 1:
+                break                                    # a last-round speaker would influence nothing
             spk_id, spk = self._pick(turns, rnd)
             transcript.append({"round": rnd, "speaker": spk_id, "answer": spk.answer,
                                "confidence": spk.confidence, "rationale": spk.rationale,
@@ -659,8 +673,30 @@ def mock_population(seed):
     return make
 
 
+def parse_panel(spec):
+    """'careful@gemini-3.8-flash:low,fast@gemini-3.1-flash-lite:none,...' ->
+    [(agent_id, persona, model, thinking)]. A repeated persona gets a numbered id."""
+    out, seen = [], defaultdict(int)
+    for item in spec.split(","):
+        persona, rest = item.strip().split("@")
+        model, _, thinking = rest.partition(":")
+        if persona not in PERSONAS:
+            sys.exit(f"--panel: unknown persona {persona!r}; choose from {list(PERSONAS)}")
+        seen[persona] += 1
+        aid = persona if seen[persona] == 1 else f"{persona}{seen[persona]}"
+        out.append((aid, persona, model, thinking or "low"))
+    return out
+
+
 def gemini_population(a):
     tl = None if a.thinking == "none" else a.thinking
+    if getattr(a, "panel", None):
+        spec = parse_panel(a.panel)
+        def make_panel():
+            return [GeminiAgent(aid, persona, model=model, temperature=a.temperature,
+                                thinking_level=None if th == "none" else th, log_path=a.log, api=a.api)
+                    for aid, persona, model, th in spec]
+        return make_panel
     def make():
         return [GeminiAgent(n, n, model=a.model, temperature=a.temperature,
                             thinking_level=tl, log_path=a.log, api=a.api)
@@ -806,12 +842,19 @@ def prestige_path(first_round, ids, mode="shrunk", alpha=0.3, prior=0.5, k=5, ru
     Returns the prestige of every agent BEFORE each problem (learned only from
     earlier problems). mode 'shrunk' = running mean pulled toward the prior with
     weight k; 'ema' = exponential average, one update per problem."""
+    # 'contested' = 'shrunk', but only problems where the agents' first answers
+    # split (some right, some wrong) count; unanimous problems teach nothing about
+    # who to trust.
     score = RULES[rule]
     v = {a: prior for a in ids}
     tot = {a: 0.0 for a in ids}
-    path = []
-    for n, r in enumerate(first_round, 1):
+    path, n = [], 0
+    for r in first_round:
         path.append(dict(v))
+        right = sum(bool(r[a][1]) for a in ids)
+        if mode == "contested" and not 0 < right < len(ids):
+            continue
+        n += 1
         for a in ids:
             s = score(*r[a])
             if mode == "ema":
@@ -823,6 +866,15 @@ def prestige_path(first_round, ids, mode="shrunk", alpha=0.3, prior=0.5, k=5, ru
 
 
 def _trial_problems(a, seed):
+    if a.offset:
+        pool = load_jsonl(a.problems, None, levels=_levels(a)) if a.problems else synthetic(a.offset + a.n, 0)
+        chunk = pool[a.offset + seed * a.n:a.offset + (seed + 1) * a.n] if a.disjoint else pool[a.offset:a.offset + a.n]
+        if len(chunk) < a.n:
+            sys.exit(f"--offset {a.offset} --n {a.n} needs more problems than {a.problems} has ({len(pool)}).")
+        if seed and not a.disjoint:
+            chunk = chunk[:]
+            random.Random(seed).shuffle(chunk)
+        return chunk
     if a.disjoint:
         pool = load_jsonl(a.problems, None, levels=_levels(a)) if a.problems else synthetic(a.n * (seed + 1), 0)
         chunk = pool[seed * a.n:(seed + 1) * a.n]
@@ -834,6 +886,36 @@ def _trial_problems(a, seed):
         base = base[:]
         random.Random(seed).shuffle(base)
     return base
+
+
+def self_consistent(samples):
+    """samples: k AgentTurns from one agent on one problem, answered independently.
+    Returns the agent's modal answer, with confidence = share of samples that
+    agree with it (3/3 -> 0.99, 2/3 -> 0.67, 1/3 -> 0.33). A model that is unsure
+    tends to give different answers each time, so agreement carries the signal
+    that stated confidence (almost always 0.99) does not."""
+    groups = []
+    for t in samples:
+        for g in groups:
+            if answers_match(t.answer, g[0].answer):
+                g.append(t); break
+        else:
+            groups.append([t])
+    best = max(groups, key=len)
+    rec = best[0].model_dump()
+    rec["stated_confidence"] = round(sum(t.confidence for t in best) / len(best), 4)
+    rec["confidence"] = min(0.99, max(0.01, len(best) / len(samples)))
+    rec["samples"] = [t.answer for t in samples]
+    return rec
+
+
+def auroc(pos, neg):
+    """P(a random right answer has higher confidence than a random wrong one); ties count half.
+    0.5 = confidence says nothing about correctness, 1.0 = perfectly separates them."""
+    if not pos or not neg:
+        return float("nan")
+    wins = sum((p > q) + 0.5 * (p == q) for p in pos for q in neg)
+    return wins / (len(pos) * len(neg))
 
 
 def _run_pool(workers, jobs, label):
@@ -869,31 +951,53 @@ def cmd_trials(a):
     bad = [p for p in pols if p not in TRIAL_POLICIES]
     if bad:
         sys.exit(f"trials supports {TRIAL_POLICIES}; {bad} need a warmup phase (use `debate`).")
-    if not a.mock and not a.model:
-        sys.exit("trials: pass --model explicitly (e.g. --model gemini-3.1-flash-lite).")
+    if not a.mock and not a.model and not a.panel:
+        sys.exit("trials: pass --model (e.g. gemini-3.1-flash-lite) or --panel.")
     store = _Store(a.store)
     cfg = {"model": "mock" if a.mock else a.model, "problems": a.problems, "n": a.n, "level": a.level,
            "rounds": a.rounds, "temperature": a.temperature, "thinking": a.thinking,
            "prestige_mode": a.prestige_mode, "alpha": a.alpha, "prior_strength": a.prior_strength,
            "rule": a.rule, "tau": a.tau, "disjoint": a.disjoint}
+    for k, v in (("panel", a.panel), ("offset", a.offset), ("stop_unanimous", a.stop_unanimous),
+                 ("sc_k", a.sc_k if a.sc_k > 1 else None), ("sc_carry", a.sc_carry)):
+        if v:                                    # only recorded when used, so old stores still resume
+            cfg[k] = v
     old = [r for r in store.rows if r["kind"] == "config"]
-    if old and old[0]["cfg"] != cfg:
-        diff = {k: (old[0]["cfg"].get(k), v) for k, v in cfg.items() if old[0]["cfg"].get(k) != v}
+    # A larger --n just adds problems. Before any debate has run, settings that only
+    # affect debates (rounds, prestige rule, ...) may still change: round-1 answers don't depend on them.
+    round1_keys = {"model", "problems", "level", "temperature", "thinking", "disjoint", "panel", "offset", "sc_k"}
+    debated = any(r["kind"] == "debate" for r in store.rows)
+    same = lambda c: {k: v for k, v in c.items() if k != "n" and (debated or k in round1_keys)}
+    if old and same(old[-1]["cfg"]) != same(cfg):
+        diff = {k: (old[-1]["cfg"].get(k), v) for k, v in cfg.items() if k != "n" and old[-1]["cfg"].get(k) != v}
         sys.exit(f"{a.store} was started with different settings {diff} (stored, now).\n"
                  f"Use a new --store file, or rerun with the original settings to resume.")
     if not old:
         store.add({"kind": "config", "cfg": cfg, "started": time.time()})
+    elif not any(r["kind"] == "debate" for r in store.rows) and old[-1]["cfg"] != cfg:
+        old[-1]["cfg"] = cfg                       # debate settings changed before any debate: record the new ones
+        store.add({"kind": "config", "cfg": cfg, "started": time.time(), "note": "debate settings updated"})
 
-    later = max(0, a.rounds - 1)
-    per_seed = a.n * 5 + len(pols) * a.n * 2 * later * 5
-    total = a.seeds * per_seed
-    have = sum(r["kind"] == "r0" for r in store.rows) * 5 + \
-           sum(r["kind"] == "debate" for r in store.rows) * 2 * later * 5
-    left = max(0, total - have)
-    print(f"model {cfg['model']} | {a.seeds} seed(s) x {a.n} problems | policies {pols} | {a.rounds} rounds | "
-          f"prestige={a.prestige_mode} | workers {a.workers} | stagger {a.stagger}s")
-    print(f"calls: {per_seed}/seed, {total} total, ~{left} still to make "
-          f"(~${left * a.price_per_call:.0f} at ~${a.price_per_call}/call, a rough guess -- check your billing; at least {left * a.stagger / 60:.0f} min at this stagger)")
+    n_ag = len(parse_panel(a.panel)) if a.panel else 5
+    later = max(0, a.rounds - 1)                 # rounds after the shared first one make calls
+    per_debate = 2 * later * n_ag                # canonical + reordered run
+    r0_rows = [r for r in store.rows if r["kind"] == "r0"]
+    n_r0 = len(r0_rows)
+    split = sum(1 for r in r0_rows if len({norm(t["answer"]) for t in r["turns"].values()}) > 1)
+    est_split = split / n_r0 if (n_r0 and a.stop_unanimous) else (0.5 if a.stop_unanimous else 1.0)
+    total_r0 = a.seeds * a.n * n_ag * a.sc_k
+    total_deb = int(a.seeds * a.n * est_split * len(pols) * per_debate) if not a.round1_only else 0
+    have_deb = sum(r.get("calls", per_debate) for r in store.rows if r["kind"] == "debate")
+    left = max(0, total_r0 - n_r0 * n_ag * a.sc_k) + max(0, total_deb - have_deb)
+    print(f"{'panel ' + a.panel if a.panel else 'model ' + cfg['model']}")
+    print(f"{a.seeds} seed(s) x {a.n} problems (offset {a.offset}) | policies {pols} | up to {a.rounds} rounds | "
+          f"prestige={a.prestige_mode} | stop when unanimous: {a.stop_unanimous} | workers {a.workers} | "
+          f"round-1 confidence: {'self-consistency, %d samples' % a.sc_k if a.sc_k > 1 else 'stated'}")
+    if a.stop_unanimous:
+        print(f"split first answers: {'%d/%d measured' % (split, n_r0) if n_r0 else 'unknown yet, assuming 50%'}")
+    print(f"calls: about {left} still to make (upper bound; ~${left * a.price_per_call:.2f} at "
+          f"${a.price_per_call}/call -- stronger models cost more per call; "
+          f"at least {left * a.stagger / 60:.0f} min at this stagger)")
     print(f"results -> {a.store} (append-only; rerun the same command to resume)\n")
     if a.dry_run:
         return
@@ -906,12 +1010,15 @@ def cmd_trials(a):
         print(f"=== seed {seed}")
 
         def do_r0(i, probs=probs, agents=agents, qids=qids, seed=seed):
-            p = probs[i]
-            with ThreadPoolExecutor(max_workers=len(agents)) as ex:
-                outs = list(ex.map(lambda ag: ag.propose(p, [], None), agents))
+            p, k = probs[i], a.sc_k
+            with ThreadPoolExecutor(max_workers=len(agents) * k) as ex:
+                outs = list(ex.map(lambda ag: ag.propose(p, [], None), [ag for ag in agents for _ in range(k)]))
+            if k == 1:
+                turns = {ag.agent_id: t.model_dump() for ag, t in zip(agents, outs)}
+            else:
+                turns = {ag.agent_id: self_consistent(outs[j * k:(j + 1) * k]) for j, ag in enumerate(agents)}
             store.add({"kind": "r0", "seed": seed, "qid": qids[i], "pid": i, "truth": p["answer"],
-                       "level": p.get("level"),
-                       "turns": {ag.agent_id: t.model_dump() for ag, t in zip(agents, outs)}})
+                       "level": p.get("level"), "turns": turns})
 
         for attempt in range(3):                      # automatic retry passes for failed tasks
             done = {r["qid"] for r in store.rows if r["kind"] == "r0" and r["seed"] == seed}
@@ -923,6 +1030,8 @@ def cmd_trials(a):
         if missing:
             sys.exit(f"{len(missing)} problems still lack first-round answers after 3 passes (API trouble). "
                      f"Rerun the same command later to resume; nothing is lost.")
+        if a.round1_only:
+            continue
 
         fr = [{aid: (r0[qids[i]]["turns"][aid]["confidence"],
                      answers_match(r0[qids[i]]["turns"][aid]["answer"], probs[i]["answer"])) for aid in ids}
@@ -933,16 +1042,21 @@ def cmd_trials(a):
             p, qid = probs[i], qids[i]
             led = PrestigeLedger(ids, rule=a.rule, values=dict(path[i]), frozen=True)
             first = {aid: AgentTurn(**r0[qid]["turns"][aid]) for aid in ids}
+            carry = ({aid: r0[qid]["turns"][aid]["samples"] for aid in ids}
+                     if a.sc_carry and all("samples" in r0[qid]["turns"][aid] for aid in ids) else None)
             mk = lambda ags, tag: Orchestrator(ags, led, pol, a.rounds, tau=a.tau, random_ties=True,
-                                               seed=f"{seed}:{qid}:{tag}")
+                                               seed=f"{seed}:{qid}:{tag}", stop_unanimous=a.stop_unanimous,
+                                               carry=carry)
             perm = agents[:]
             random.Random(f"{seed}:{qid}").shuffle(perm)
             with ThreadPoolExecutor(max_workers=2) as ex:      # canonical + reordered run side by side
                 f_canon = ex.submit(mk(agents, "canon").run, p, False, first)
                 f_pert = ex.submit(mk(perm, "order").run, p, False, first)
                 canon, pert = f_canon.result(), f_pert.result()
+            calls = sum(len(v) - 1 for v in canon.submissions.values()) + \
+                    sum(len(v) - 1 for v in pert.submissions.values())
             store.add({"kind": "debate", "seed": seed, "policy": pol, "qid": qid, "pid": i,
-                       "truth": p["answer"], "prestige": path[i],
+                       "truth": p["answer"], "prestige": path[i], "calls": calls,
                        "canon": {"final": canon.final_answer,
                                  "speakers": [t["speaker"] for t in canon.transcript],
                                  "last": {k: v[-1].answer for k, v in canon.submissions.items()}},
@@ -959,7 +1073,48 @@ def cmd_trials(a):
             print(f"WARNING: seed {seed} still has failed debates after 3 passes; "
                   f"rerun the same command later to fill them in.", flush=True)
 
+    if a.round1_only:
+        report_round1(store.rows)
+        print("\nRound 1 done. Rerun the same command without --round1-only to run the debates "
+              "(first answers are reused, not repaid).")
+        return
     report_trials(store.rows, pols, out=a.out)
+
+
+def report_round1(rows):
+    """Per-agent accuracy on independent first answers: does the panel really differ?"""
+    cfg = next((r["cfg"] for r in rows if r["kind"] == "config"), {})
+    models = {aid: f"{m}:{th}" for aid, _, m, th in parse_panel(cfg["panel"])} if cfg.get("panel") else {}
+    r0 = [r for r in rows if r["kind"] == "r0"]
+    if not r0:
+        return
+    ids = list(r0[0]["turns"])
+    print(f"\nround-1 accuracy per agent ({len(r0)} problem-runs)")
+    for aid in ids:
+        ok = [answers_match(r["turns"][aid]["answer"], r["truth"]) for r in r0]
+        conf = [r["turns"][aid]["confidence"] for r in r0]
+        print(f"  {aid:12s} {models.get(aid, ''):34s} acc {sum(ok) / len(ok):.3f}   mean conf {sum(conf) / len(conf):.2f}")
+    # Calibration check: does confidence separate right answers from wrong ones?
+    pts = [(t, answers_match(t["answer"], r["truth"])) for r in r0 for t in r["turns"].values()]
+    acc_all = sum(ok for _, ok in pts) / len(pts)
+    print(f"\nconfidence check over {len(pts)} answers (overall accuracy {acc_all:.3f})")
+    measures = [("stated confidence", lambda t: round(t.get("stated_confidence", t["confidence"]), 3))]
+    if any("samples" in t for t, _ in pts):
+        measures.append(("self-consistency", lambda t: t["confidence"]))
+    for name, f in measures:
+        right = [f(t) for t, ok in pts if ok]
+        wrong = [f(t) for t, ok in pts if not ok]
+        print(f"  {name:18s} AUROC {auroc(right, wrong):.3f}   (0.5 = no signal; 0.75+ = useful)")
+        levels = defaultdict(list)
+        for t, ok in pts:
+            levels[round(f(t), 2)].append(ok)
+        for c in sorted(levels):
+            if len(levels[c]) >= 5 or name == "self-consistency":
+                print(f"      conf {c:.2f}: {len(levels[c]):5d} answers, {sum(levels[c]) / len(levels[c]):.0%} right")
+    k = [sum(answers_match(t["answer"], r["truth"]) for t in r["turns"].values()) for r in r0]
+    split = sum(len({norm(t["answer"]) for t in r["turns"].values()}) > 1 for r in r0)
+    print(f"  contested (some right, some wrong): {sum(0 < x < len(ids) for x in k)}/{len(r0)}   "
+          f"all wrong: {sum(x == 0 for x in k)}   first answers not unanimous: {split}/{len(r0)}")
 
 
 def report_trials(rows, pols=None, ref="round_robin", B=2000, out=None):
@@ -1005,6 +1160,7 @@ def report_trials(rows, pols=None, ref="round_robin", B=2000, out=None):
         sd = f" +-{st.stdev(xs):.3f}" if len(xs) > 1 else ""
         return f"{mean(xs):.3f}{sd}"
 
+    report_round1(rows)
     print(f"\n{len(seeds)} seed(s); mean +- sd across seeds; every problem scored (no warmup)\n")
     print(f"{'':30s}{'accuracy':>16s}{'flip':>16s}{'C->W':>14s}{'W->C':>14s}{'acc 2nd half':>16s}{'acc contested':>16s}")
     base_single, base_maj = [], []
@@ -1026,12 +1182,51 @@ def report_trials(rows, pols=None, ref="round_robin", B=2000, out=None):
         base_single.append(mean(single)); base_maj.append(mean(maj))
     print(f"{'single agent (round 1)':30s}{fmt(base_single):>16s}")
     print(f"{'majority vote, no debate':30s}{fmt(base_maj):>16s}")
+    # Weighted votes over the round-1 answers alone (no debate, no extra calls).
+    prest = {}
+    for recs in deb.values():
+        for key, rec in recs.items():
+            prest.setdefault(key, rec["prestige"])
+    def wvote(r, w):
+        groups = []
+        for aid, t in r["turns"].items():
+            for g in groups:
+                if answers_match(t["answer"], g[0]):
+                    g[1] += w(aid, t); break
+            else:
+                groups.append([t["answer"], w(aid, t)])
+        return float(answers_match(max(groups, key=lambda g: g[1])[0], r["truth"]))
+    nd = {"confidence vote, no debate": lambda key: (lambda aid, t: t["confidence"]),
+          "prestige*conf vote, no debate": lambda key: (lambda aid, t: prest[key].get(aid, 0.5) * t["confidence"])}
+    for label, mk in nd.items():
+        vals = [mean([wvote(r, mk(key)) for key, r in r0.items() if key[0] == sd and key in prest]) for sd in seeds]
+        print(f"{label:30s}{fmt(vals):>16s}")
     summary = {"seeds": seeds, "baseline_single": base_single, "baseline_majority": base_maj, "policies": {}}
     for p in pols:
         cols = [by_seed(p, "acc"), by_seed(p, "flip"), by_seed(p, "c2w"), by_seed(p, "w2c"),
                 by_seed(p, "acc", lambda d: d["late"]), by_seed(p, "acc", lambda d: d["contested"])]
         print(f"{p:30s}" + "".join(f"{fmt(c):>{w}s}" for c, w in zip(cols, [16, 16, 14, 14, 16, 16])))
         summary["policies"][p] = dict(zip(["acc", "flip", "c2w", "w2c", "acc_late", "acc_contested"], cols))
+
+    # Free check: round robin's own final answers, re-voted with prestige weights.
+    if "round_robin" in deb:
+        rv = defaultdict(list)
+        for (s, q), rec in deb["round_robin"].items():
+            last = rec["canon"].get("last")
+            if not last:
+                continue
+            groups = []
+            for aid, ans in last.items():
+                w = rec["prestige"].get(aid, 0.5)
+                for g in groups:
+                    if answers_match(ans, g[0]):
+                        g[1] += w; break
+                else:
+                    groups.append([ans, w])
+            rv[s].append(float(answers_match(max(groups, key=lambda g: g[1])[0], rec["truth"])))
+        if rv:
+            print(f"{'round_robin + prestige vote':30s}{fmt([mean(rv[s]) for s in seeds if rv[s]]):>16s}"
+                  f"   (offline: same debates, final vote weighted by prestige)")
 
     if ref in pols and len(pols) > 1:
         print(f"\npaired differences vs {ref} (95% bootstrap CI over problems; problems shared across seeds are resampled together)")
@@ -1050,7 +1245,28 @@ def report_trials(rows, pols=None, ref="round_robin", B=2000, out=None):
                 row += f"  d{field} {mean(vals):+.3f} [{lo:+.3f}, {hi:+.3f}]"
                 summary["policies"][p][f"d_{field}_vs_{ref}"] = [mean(vals), lo, hi]
             print(row)
+            # McNemar exact test: only problems where exactly one policy was right carry information.
+            b = sum(1 for k in keys if D[p][k]["acc"] and not D[ref][k]["acc"])
+            c = sum(1 for k in keys if D[ref][k]["acc"] and not D[p][k]["acc"])
+            n_bc = b + c
+            pval = min(1.0, 2 * sum(math.comb(n_bc, i) for i in range(min(b, c) + 1)) / 2 ** n_bc) if n_bc else 1.0
+            print(f"  {'':18s}  McNemar exact: {p} right & {ref} wrong on {b}, the reverse on {c}  ->  p = {pval:.3f}")
+            summary["policies"][p]["mcnemar"] = {"b": b, "c": c, "p": pval}
         print("  (an interval containing 0 means the difference is not distinguishable from noise)")
+
+    # Mechanism: on problems where first answers disagreed, how often did the
+    # chosen speaker hold the right answer?
+    print("\nspeaker analysis (problems where first answers disagreed and the debate ran)")
+    for p in pols:
+        hit = []
+        for key, rec in deb[p].items():
+            spk = rec["canon"]["speakers"]
+            if not spk:
+                continue
+            t = r0[key]["turns"][spk[0]]
+            hit.append(answers_match(t["answer"], rec["truth"]))
+        if hit:
+            print(f"  {p:18s} first speaker was right on {sum(hit)}/{len(hit)} = {sum(hit) / len(hit):.0%}")
     if out:
         with open(out, "w") as f:
             json.dump(summary, f, indent=2)
@@ -1058,7 +1274,9 @@ def report_trials(rows, pols=None, ref="round_robin", B=2000, out=None):
 
 
 def cmd_report(a):
-    store = _Store(a.store)
+    class _Merged:                                   # --store a.jsonl,b.jsonl -> one combined report
+        rows = [r for path in a.store.split(",") for r in _Store(path).rows]
+    store = _Merged()
     report_trials(store.rows, a.policies.split(",") if a.policies != ",".join(POLICIES) else None, out=a.out)
 
 
@@ -1092,13 +1310,24 @@ def main():
                         "cheaper first pass, e.g. --perturbations order,fresh")
     ap.add_argument("--warmup-frac", type=float, default=0.4, help="debate: share of problems used as warmup")
     ap.add_argument("--workers", type=int, default=6, help="trials: debates run concurrently")
-    ap.add_argument("--store", default="trials.jsonl", help="trials/report: append-only results file")
-    ap.add_argument("--prestige-mode", default="shrunk", choices=["shrunk", "ema"],
+    ap.add_argument("--store", default="trials.jsonl",
+                    help="trials/report: append-only results file (report accepts several, comma-separated)")
+    ap.add_argument("--prestige-mode", default="shrunk", choices=["shrunk", "ema", "contested"],
                     help="trials: 'shrunk' = running mean pulled toward the prior; 'ema' uses --alpha")
     ap.add_argument("--prior-strength", type=float, default=5.0, help="trials: pseudo-problems of prior in 'shrunk'")
     ap.add_argument("--disjoint", action="store_true", help="trials: a different block of --n problems per seed")
     ap.add_argument("--mock", action="store_true", help="trials: simulated agents, no API calls")
-    ap.add_argument("--price-per-call", type=float, default=0.002, help="trials: $ per call, for the estimate only")
+    ap.add_argument("--price-per-call", type=float, default=0.00065, help="trials: $ per call, for the estimate only")
+    ap.add_argument("--panel", default=None,
+                    help="trials: mixed panel, e.g. 'careful@gemini-3.8-flash:low,fast@gemini-3.1-flash-lite:none'")
+    ap.add_argument("--offset", type=int, default=0, help="trials: skip the first N problems (use fresh ones)")
+    ap.add_argument("--stop-unanimous", action="store_true", help="trials: end a debate once every agent agrees")
+    ap.add_argument("--sc-k", type=int, default=1,
+                    help="trials: round-1 samples per agent; >1 = confidence from self-consistency (agreement)")
+    ap.add_argument("--sc-carry", action="store_true",
+                    help="trials: in later rounds, confidence = share of the agent's round-1 samples matching its current answer")
+    ap.add_argument("--round1-only", action="store_true",
+                    help="trials: only collect independent first answers (cheap panel check); rerun without it to debate")
     ap.add_argument("--dry-run", action="store_true", help="trials: print the plan and cost, make no calls")
     a = ap.parse_args()
     if a.seeds is None:

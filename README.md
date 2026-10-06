@@ -1,109 +1,121 @@
 # Prestige-Weighted, Confidence-Scored Multi-Agent Debate
 
-Does scoring each LLM agent's stated confidence against whether it was actually
-right, and letting that running score decide who gets heard, make a group of
-agents more accurate or more stable than a debate where confidence carries no
-consequence?
+Does it help a group of LLM agents to let the agent with the best track record
+and the strongest confidence speak, instead of taking turns? This repo tests
+**prestige × confidence** speaker selection against **round-robin** debate on
+MATH problems, with agents of the same model.
 
-One self-contained script (`mad_gemini.py`) on the Gemini API, plain Python, no framework.
+One script (`mad_gemini.py`) on the Gemini API, plain Python.
 
 ## How it works
 
-- 5 agents (same model, different personas: careful, fast, skeptic, teacher,
-  contrarian) debate a problem for several rounds. Each turn returns JSON:
-  answer, confidence (0–1), key uncertainty.
-- Each round one speaker is chosen by the policy; everyone sees that turn and may revise.
-- Final answer = weighted vote over last-round answers, grouping mathematically
-  equivalent forms (`14/3` = `\frac{14}{3}`).
-- After each problem, confidences are scored against the truth with a proper
-  scoring rule (Brier or log), and each agent's **prestige** (an EMA of that
-  score) updates. Prestige never changes mid-debate.
+- 5 agents (one model, personas: careful, fast, skeptic, teacher, contrarian) solve a
+  problem. Round 1 is independent; in later rounds each agent sees a transcript of
+  who spoke and may revise. Each turn returns JSON: answer, confidence, key uncertainty.
+- Each round the **policy** picks one speaker. The final answer is a vote over
+  last-round answers (unweighted for round robin, weighted otherwise).
+- **Prestige** = each agent's running Brier score on its independent round-1 answers,
+  pulled toward 0.5. Problem *i* uses only earlier problems: no warmup, every problem scored.
+- **Self-consistency confidence** (`--sc-k 3`): each agent answers round 1 three times;
+  confidence = share of samples agreeing with its modal answer. `--sc-carry` carries it into
+  later rounds (share of the agent's own round-1 samples matching its current answer).
+- **Stability:** each debate is rerun with the agents reordered; a changed final answer is a flip.
+- All policies share the same round-1 answers, so comparisons are paired.
 
 | Policy | Speaker / vote weight |
 |---|---|
-| `prestige_x_conf` | prestige × confidence (proposed) |
-| `conf_only` | confidence, no consequence |
-| `posthoc` | Platt-calibrated confidence |
-| `prestige_only` | prestige alone |
 | `round_robin` | rotate speaker, unweighted vote |
-| `fixed` | prestige frozen after warmup |
-
-**Stability:** each test problem is rerun with prestige frozen under
-perturbations (`--perturbations order,drop,fresh`: reorder agents, drop one,
-swap in a fresh agent), and we count how often the final answer flips,
-split into correct→wrong and wrong→correct.
+| `prestige_x_conf` | prestige × confidence (proposed) |
+| `conf_only` | confidence alone |
+| `prestige_only` | prestige alone |
 
 ## Setup
 
 ```bash
-pip install -r requirements.txt   # google-genai, pydantic, sympy (sympy is required for answer grading)
+pip install -r requirements.txt   # google-genai, pydantic, sympy (sympy is needed for grading)
 
-# Vertex AI (bills Google Cloud credit)
+# Vertex AI
 gcloud auth application-default login
 export GOOGLE_GENAI_USE_VERTEXAI=True GOOGLE_CLOUD_PROJECT=your-project GOOGLE_CLOUD_LOCATION=us-east4
-# or the Developer API (separate prepaid balance)
+# or the Developer API
 export GEMINI_API_KEY=...
 ```
 
 ## Usage
 
 ```bash
-python3 mad_gemini.py mock --n 80 --seeds 8        # simulated agents, no API calls
-python3 mad_gemini.py smoke                         # one real call, full errors
-python3 mad_gemini.py calib --problems math.jsonl --n 100 --model gemini-3.1-flash-lite
-date +%s    # note the timestamp so this run's calls can be isolated later
-python3 mad_gemini.py trials --problems math.jsonl --n 100 --seeds 3 --model gemini-3.1-flash-lite \
-    --policies round_robin,prestige_x_conf --stagger 0.3 --workers 6 --store trials.jsonl --dry-run
-python3 mad_gemini.py report --store trials.jsonl   # regrade + summarize, no API calls
+# Experiment 2 (self-consistency); --dry-run prints the plan and call count first
+python3 mad_gemini.py trials --problems math.jsonl --n 230 --offset 100 --seeds 3 \
+  --model gemini-3.1-flash-lite --sc-k 3 --sc-carry --rounds 3 \
+  --policies round_robin,prestige_x_conf,conf_only --stop-unanimous \
+  --stagger 0.3 --workers 6 --store sc.jsonl --dry-run
+
+# Regrade and summarize stored results (no API calls); several stores can be combined
+python3 mad_gemini.py report --store sc.jsonl --policies round_robin,prestige_x_conf,conf_only
 ```
 
-`trials` is resumable: rerun the same command after a crash or Ctrl-C.
+- `trials` is resumable: rerun the same command after a crash or Ctrl-C.
+- `--round1-only` collects first answers only (a cheap confidence check); rerun without it to debate.
+- `--stop-unanimous` debates only problems where first answers disagree.
+- `--panel` sets a model per agent; `--mock` runs simulated agents with no API calls.
+- `make_math_extra.py` builds unseen problems from the full MATH test set (minus MATH-500).
 
-Problem files are JSONL: `{"question", "answer"}` or MATH-style
-`{"problem", "solution", "level"}` (the `\boxed{}` answer is extracted;
-`--level 4,5` filters). All calls are logged to `calls.jsonl`. Two scripts
-analyze that log:
+`report` prints per-agent accuracy, a confidence check (AUROC), no-debate baselines,
+accuracy and flip rates per policy, paired bootstrap CIs, McNemar's exact test, and a
+speaker analysis.
 
-- `summarize_calls.py`: accuracy and confidence tables by model and dataset
-  (`--since <ts>` isolates one run).
-- `analyze_calibration.py`: confidently-wrong and hedged-but-right answers per agent.
+## Results (gemini-3.1-flash-lite, MATH, 3 seeds each)
 
-## Findings so far
+**Experiment 1: stated confidence, problems 1–100, every problem debated.**
 
-**Main result (`trials`: gemini-3.1-flash-lite, 100 MATH problems, 3 seeds, 3 rounds, no warmup).**
-Mean ± SD across seeds; results in `results/`.
+| Method | Accuracy | Flip |
+|---|---|---|
+| Majority vote, no debate | 85.3% | – |
+| Round robin | **88.3%** | 9.7% |
+| Prestige × confidence | 86.0% | 6.7% |
 
-| Method | Accuracy | Flip | C→W |
+Accuracy −2.3 points [−5.7, +0.3], n.s. Stated confidence sat at 0.99, so the policy had
+no per-problem signal and mostly gave the floor to the confident majority.
+
+**Experiment 2: self-consistency confidence, problems 101–330, debate on disagreement.**
+
+| Method | Accuracy | Flip | Correct → wrong |
 |---|---|---|---|
-| Single agent (round 1) | 81.1 ± 2.3% | – | – |
-| Majority vote, no debate | 85.3 ± 2.3% | – | – |
-| Round-robin debate | **88.3 ± 1.5%** | 9.7 ± 2.5% | 4.3 ± 2.1% |
-| Prestige × confidence | 86.0 ± 1.7% | **6.7 ± 2.3%** | **2.0 ± 2.6%** |
+| Majority vote, no debate | 82.9% | – | – |
+| Round robin | **84.9%** | 8.6% | 2.5% |
+| Confidence only | 84.1% | 4.5% | 1.3% |
+| Prestige × confidence | 84.3% | **1.6%** | **0.3%** |
 
-Paired differences (prestige × confidence − round robin, 95% bootstrap CI over problems):
-accuracy −2.3 [−5.7, +0.3], flip −3.0 [−6.7, +0.3], C→W −2.3 [−5.3, +0.3]. None significant.
+- **Accuracy (primary): no difference.** −0.6 points [−2.0, +0.7]; McNemar 12 vs 16, p = 0.57.
+- **Confidence works:** 3/3 agreeing samples were right 93% of the time, 2/3 52%, 1/3 13% (AUROC 0.80).
+- **Better speakers:** the first speaker held the right answer 44% of the time vs 34% for round robin.
+- **Fewer flips under reordering** (−7.0 points [−9.6, −4.5]), but much of this is by design:
+  round robin's speaker is set by agent order, prestige × confidence's by content.
+- **Little headroom:** all agents were wrong on 12.3% of problem-runs, capping accuracy near 88%.
 
-- **Debate helps:** round robin beats majority vote by 3 points and one agent by 7.
-- **Prestige × confidence doesn't beat round robin.** It trends more stable but less accurate,
-  most visibly on contested problems (73.9% vs 81.6%).
-- **Likely reason:** with near-identical agents and confidence pinned near 0.99, it hands the
-  floor to the confident majority every round, so a correct dissenter is rarely heard.
-- In the mock test with genuinely different agents, prestige × confidence does win.
+**Takeaway:** among agents of the same level, prestige × confidence picks better speakers and
+removes round robin's dependence on agent order, but does not get more answers right.
 
-`trials` scores prestige from each agent's independent first-round answer (running mean,
-prior 0.5 worth 5 problems), so every problem is scored and debates run in parallel. Both
-policies share the same first-round answers (paired). Earlier single-run results (76.7% for
-both policies, old grader, 40% warmup) are superseded.
+Earlier single-run results (76.7% for both policies) are superseded; they used a faulty
+grader and a 40% warmup.
+
+## Repo layout
+
+| Path | Contents |
+|---|---|
+| `mad_gemini.py` | Agents, policies, `trials` / `report` commands, grader |
+| `make_math_extra.py` | Builds unseen MATH test problems |
+| `mad_gemini_independent_personas.py` | Earlier independent-personas variant, kept for reference |
+| `runs/<date>_<name>/` | Raw results (`*.jsonl`, regradable with `report`) and summaries per experiment |
 
 ## Next steps
 
-- Check the mechanism from stored data: speaker agreement with the round-1 majority per policy.
-- Sample the speaker by weight (`--tau`) instead of always picking the top one.
-- Mixed-skill population (different models or thinking levels) so reliability actually varies.
-- More problems rather than more seeds: the paired CI is about ±3 points at n=100.
+- Resampling stability test: same agent order, fresh model calls.
+- Check how often debate changes answers on unanimous problems.
+- Harder problems, so more are contested.
+- Mixed-skill panel, where prestige has real reliability differences to learn.
 
 ## Known issues
 
-- Vertex AI connections drop intermittently; retries with jittered backoff absorb
-  most of it, but long runs are slow. Cost is ~$0.009/call.
-- `--api interactions` isn't available on Vertex; use the default `legacy` transport.
+- Vertex AI connections drop intermittently; retries with jittered backoff absorb them.
+- Five MATH-500 problems are skipped because their reference answer can't be parsed.
