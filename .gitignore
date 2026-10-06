@@ -1,8 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
-calls.jsonl
-results.json
 summary*.md
 *.env
 .DS_Store
+calls.jsonl
