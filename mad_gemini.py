@@ -344,7 +344,7 @@ class MockAgent:
 # 4. ORCHESTRATOR — one problem = one debate = N rounds
 # ===========================================================================
 
-POLICIES = ["prestige_x_conf", "conf_only", "posthoc", "prestige_only", "round_robin", "fixed"]
+POLICIES = ["prestige_x_conf", "conf_only", "posthoc", "prestige_only", "round_robin", "fixed", "both_sides"]
 
 
 def _wrap(x: str) -> str:
@@ -402,7 +402,17 @@ def answers_match(a, b) -> bool:
     algebraic/numeric equivalence (e.g. 14/3 == \\frac{14}{3} == 4.6667,
     (11+9a)/20 == \\frac{9a+11}{20}). Base subscripts are optional (4343_6 == 4343)."""
     na, nb = norm(a), norm(b)
-    if na == nb or _sympy_equal(na, nb):
+    if na == nb:
+        return True
+    # multiple choice (e.g. GPQA): truth is a single letter; accept "B", "(B)", "B)", "B. text"
+    for x, y in ((na, nb), (nb, na)):
+        if re.fullmatch(r"[a-e]", y):
+            m = re.match(r"\(?([a-e])(\)|\.|:|$)", x)
+            if m:
+                return m.group(1) == y
+            if re.fullmatch(r"(option|answer)?\(?[a-e]\)?", x):
+                return x.strip("()")[-1] == y
+    if _sympy_equal(na, nb):
         return True
     # a base subscript on only one side: compare without it
     sa, sb = re.sub(r"_\d+$", "", na), re.sub(r"_\d+$", "", nb)
@@ -441,11 +451,19 @@ class Orchestrator:
     def weight(self, agent_id: str, turn: AgentTurn) -> float:
         p, c = self.ledger.get(agent_id), turn.confidence
         return {"prestige_x_conf": p * c, "fixed": p * c, "conf_only": c,
-                "posthoc": self.scaler(c), "prestige_only": p, "round_robin": 1.0}[self.policy]
+                "posthoc": self.scaler(c), "prestige_only": p, "round_robin": 1.0,
+                "both_sides": p * c}[self.policy]
 
     def _pick(self, turns, rnd):
         if self.policy == "round_robin":
             return turns[rnd % len(turns)]
+        if self.policy == "both_sides" and getattr(self, "_spoken", None):
+            # After the top-ranked agent has spoken, the floor goes to the top-ranked
+            # agent holding an answer nobody has argued yet, so a confidently wrong
+            # leader is always challenged by the most credible alternative.
+            fresh = [(a, t) for a, t in turns if not any(answers_match(t.answer, x) for x in self._spoken)]
+            if fresh:
+                turns = fresh
         ws = [self.weight(a, t) for a, t in turns]
         if self.tau is None:
             if self.random_ties:
@@ -480,6 +498,7 @@ class Orchestrator:
                 break                                    # everyone agrees: nothing left to debate
             if rnd == self.rounds - 1:
                 break                                    # a last-round speaker would influence nothing
+            self._spoken = [x["answer"] for x in transcript]
             spk_id, spk = self._pick(turns, rnd)
             transcript.append({"round": rnd, "speaker": spk_id, "answer": spk.answer,
                                "confidence": spk.confidence, "rationale": spk.rationale,
@@ -814,7 +833,7 @@ def cmd_debate(a):
 # answers, so the comparison is paired. Everything is appended to a JSONL store
 # (resumable, regradable) and summarized by `report`.
 
-TRIAL_POLICIES = ("prestige_x_conf", "conf_only", "prestige_only", "round_robin")
+TRIAL_POLICIES = ("prestige_x_conf", "conf_only", "prestige_only", "round_robin", "both_sides")
 
 
 def _qid(problem):
@@ -953,13 +972,21 @@ def cmd_trials(a):
         sys.exit(f"trials supports {TRIAL_POLICIES}; {bad} need a warmup phase (use `debate`).")
     if not a.mock and not a.model and not a.panel:
         sys.exit("trials: pass --model (e.g. gemini-3.1-flash-lite) or --panel.")
+    if a.init_from and not os.path.exists(a.store):
+        # start a new store from another run's round-1 answers (same problems, no new round-1 calls)
+        with open(a.init_from) as src, open(a.store, "w") as dst:
+            for line in src:
+                if line.strip() and json.loads(line)["kind"] in ("config", "r0"):
+                    dst.write(line)
+        print(f"initialized {a.store} with round-1 answers from {a.init_from}")
     store = _Store(a.store)
     cfg = {"model": "mock" if a.mock else a.model, "problems": a.problems, "n": a.n, "level": a.level,
            "rounds": a.rounds, "temperature": a.temperature, "thinking": a.thinking,
            "prestige_mode": a.prestige_mode, "alpha": a.alpha, "prior_strength": a.prior_strength,
            "rule": a.rule, "tau": a.tau, "disjoint": a.disjoint}
     for k, v in (("panel", a.panel), ("offset", a.offset), ("stop_unanimous", a.stop_unanimous),
-                 ("sc_k", a.sc_k if a.sc_k > 1 else None), ("sc_carry", a.sc_carry)):
+                 ("sc_k", a.sc_k if a.sc_k > 1 else None), ("sc_carry", a.sc_carry),
+                 ("conf_mix", a.conf_mix if a.conf_mix != "sc" else None)):
         if v:                                    # only recorded when used, so old stores still resume
             cfg[k] = v
     old = [r for r in store.rows if r["kind"] == "config"]
@@ -1033,7 +1060,9 @@ def cmd_trials(a):
         if a.round1_only:
             continue
 
-        fr = [{aid: (r0[qids[i]]["turns"][aid]["confidence"],
+        mix = (lambda t: (t["confidence"] + t.get("stated_confidence", t["confidence"])) / 2) \
+            if a.conf_mix == "avg" else (lambda t: t["confidence"])
+        fr = [{aid: (mix(r0[qids[i]]["turns"][aid]),
                      answers_match(r0[qids[i]]["turns"][aid]["answer"], probs[i]["answer"])) for aid in ids}
               for i in range(len(probs))]
         path = prestige_path(fr, ids, a.prestige_mode, a.alpha, k=a.prior_strength, rule=a.rule)
@@ -1041,7 +1070,8 @@ def cmd_trials(a):
         def do_debate(pol, i, probs=probs, agents=agents, ids=ids, qids=qids, path=path, r0=r0, seed=seed):
             p, qid = probs[i], qids[i]
             led = PrestigeLedger(ids, rule=a.rule, values=dict(path[i]), frozen=True)
-            first = {aid: AgentTurn(**r0[qid]["turns"][aid]) for aid in ids}
+            first = {aid: AgentTurn(**{**r0[qid]["turns"][aid], "confidence": mix(r0[qid]["turns"][aid])})
+                     for aid in ids}
             carry = ({aid: r0[qid]["turns"][aid]["samples"] for aid in ids}
                      if a.sc_carry and all("samples" in r0[qid]["turns"][aid] for aid in ids) else None)
             mk = lambda ags, tag: Orchestrator(ags, led, pol, a.rounds, tau=a.tau, random_ties=True,
@@ -1273,6 +1303,95 @@ def report_trials(rows, pols=None, ref="round_robin", B=2000, out=None):
         print("\nwrote", out)
 
 
+def cmd_resample(a):
+    """Stability without reordering: rerun every debated problem with the SAME agent
+    order and fresh model calls, and count how often the final answer changes.
+    Unlike the reorder test, this does not penalize round robin by construction."""
+    src = _Store(a.store)
+    cfgs = [r["cfg"] for r in src.rows if r["kind"] == "config"]
+    if not cfgs:
+        sys.exit(f"{a.store} has no config row; is it a trials store?")
+    cfg = cfgs[-1]
+    for k in ("problems", "level", "rounds", "temperature", "thinking", "tau", "panel"):
+        setattr(a, k, cfg.get(k, getattr(a, k, None)))
+    a.model = None if cfg.get("model") == "mock" else cfg.get("model")
+    carry_on, stop_on = bool(cfg.get("sc_carry")), bool(cfg.get("stop_unanimous"))
+    pols = a.policies.split(",") if a.policies != ",".join(POLICIES) else None
+    out = _Store(a.resample_store)
+    done = {(r["seed"], r["policy"], r["qid"]) for r in out.rows if r["kind"] == "resample"}
+    r0 = {(r["seed"], r["qid"]): r for r in src.rows if r["kind"] == "r0"}
+    debs = [r for r in src.rows if r["kind"] == "debate" and r["canon"]["speakers"]
+            and (pols is None or r["policy"] in pols)]
+    pool = load_jsonl(a.problems, None, levels=_levels(a)) if a.problems else synthetic(1000, 0)
+    byq = {_qid(p): p for p in pool}
+    mock = cfg.get("model") == "mock"
+    agents = mock_population(0)() if mock else gemini_population(a)()
+    ids = [x.agent_id for x in agents]
+    todo = [r for r in debs if (r["seed"], r["policy"], r["qid"]) not in done]
+    n_ag = len(ids)
+    print(f"resampling {len(debs)} debated problem-runs ({len(todo)} left), same agent order, fresh calls; "
+          f"up to {len(todo) * max(0, a.rounds - 1) * n_ag} calls (~${len(todo) * max(0, a.rounds - 1) * n_ag * a.price_per_call:.2f})")
+    if a.dry_run:
+        return
+
+    def job(rec):
+        key = (rec["seed"], rec["qid"])
+        p = byq[rec["qid"]]
+        led = PrestigeLedger(ids, rule=cfg.get("rule", "brier"), values=dict(rec["prestige"]), frozen=True)
+        turns = r0[key]["turns"]
+        first = {aid: AgentTurn(**turns[aid]) for aid in ids}
+        carry = ({aid: turns[aid]["samples"] for aid in ids}
+                 if carry_on and all("samples" in turns[aid] for aid in ids) else None)
+        res = Orchestrator(agents, led, rec["policy"], a.rounds, tau=a.tau, random_ties=True,
+                           seed=f"{rec['seed']}:{rec['qid']}:resample", stop_unanimous=stop_on,
+                           carry=carry).run(p, False, first)
+        out.add({"kind": "resample", "seed": rec["seed"], "policy": rec["policy"], "qid": rec["qid"],
+                 "truth": rec["truth"], "final": res.final_answer, "canon_final": rec["canon"]["final"],
+                 "order_final": rec["order"]["final"]})
+
+    for attempt in range(3):
+        done = {(r["seed"], r["policy"], r["qid"]) for r in out.rows if r["kind"] == "resample"}
+        jobs = [(lambda r=r: job(r)) for r in debs if (r["seed"], r["policy"], r["qid"]) not in done]
+        if not _run_pool(a.workers, jobs, "resample" + (f" retry {attempt}" if attempt else "")):
+            break
+    report_resample(out.rows)
+
+
+def report_resample(rows, ref="round_robin", B=4000):
+    recs = [r for r in rows if r["kind"] == "resample"]
+    by = defaultdict(dict)
+    for r in recs:
+        ok_c = answers_match(r["canon_final"], r["truth"])
+        ok_n = answers_match(r["final"], r["truth"])
+        flip = not answers_match(r["final"], r["canon_final"])
+        oflip = not answers_match(r["order_final"], r["canon_final"])
+        by[r["policy"]][(r["seed"], r["qid"])] = dict(flip=float(flip), c2w=float(flip and ok_c and not ok_n),
+                                                      w2c=float(flip and ok_n and not ok_c), oflip=float(oflip))
+    print("\nresampling test on debated problem-runs (same order, fresh calls)")
+    print(f"{'policy':18s}{'n':>5s}{'resample flip':>15s}{'C->W':>8s}{'W->C':>8s}{'reorder flip':>15s}")
+    mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
+    for p, d in sorted(by.items()):
+        v = list(d.values())
+        print(f"{p:18s}{len(v):5d}{mean([x['flip'] for x in v]):15.1%}{mean([x['c2w'] for x in v]):8.1%}"
+              f"{mean([x['w2c'] for x in v]):8.1%}{mean([x['oflip'] for x in v]):15.1%}")
+    rng = random.Random(0)
+    for p in by:
+        for q in by:
+            if p == q or q not in (ref, "conf_only") or (q == "conf_only" and p != "prestige_x_conf"):
+                continue
+            keys = sorted(set(by[p]) & set(by[q]))
+            if not keys:
+                continue
+            per = defaultdict(list)
+            for k in keys:
+                per[k[1]].append(by[p][k]["flip"] - by[q][k]["flip"])
+            vals = [mean(x) for x in per.values()]
+            bs = sorted(mean(rng.choices(vals, k=len(vals))) for _ in range(B))
+            print(f"  resample flip {p} - {q}: {mean(vals) * 100:+.1f} points "
+                  f"[{bs[int(.025 * B)] * 100:+.1f}, {bs[int(.975 * B) - 1] * 100:+.1f}] over {len(keys)} problem-runs")
+    print("  (reorder flip on the same problem-runs shown for comparison; an interval containing 0 = no clear difference)")
+
+
 def cmd_report(a):
     class _Merged:                                   # --store a.jsonl,b.jsonl -> one combined report
         rows = [r for path in a.store.split(",") for r in _Store(path).rows]
@@ -1283,7 +1402,7 @@ def cmd_report(a):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["smoke", "mock", "calib", "debate", "trials", "report"])
+    ap.add_argument("cmd", choices=["smoke", "mock", "calib", "debate", "trials", "report", "resample"])
     ap.add_argument("--problems", default=None, help="JSONL file; omit for synthetic arithmetic")
     ap.add_argument("--level", default=None, help="MATH levels to keep, e.g. '4,5' (comma-separated)")
     ap.add_argument("--n", type=int, default=60)
@@ -1322,6 +1441,10 @@ def main():
                     help="trials: mixed panel, e.g. 'careful@gemini-3.8-flash:low,fast@gemini-3.1-flash-lite:none'")
     ap.add_argument("--offset", type=int, default=0, help="trials: skip the first N problems (use fresh ones)")
     ap.add_argument("--stop-unanimous", action="store_true", help="trials: end a debate once every agent agrees")
+    ap.add_argument("--resample-store", default="resample.jsonl", help="resample: output file")
+    ap.add_argument("--conf-mix", default="sc", choices=["sc", "avg"],
+                    help="trials: round-1 confidence = self-consistency (sc) or its average with stated confidence (avg)")
+    ap.add_argument("--init-from", default=None, help="trials: copy round-1 answers from this store into a new --store")
     ap.add_argument("--sc-k", type=int, default=1,
                     help="trials: round-1 samples per agent; >1 = confidence from self-consistency (agreement)")
     ap.add_argument("--sc-carry", action="store_true",
@@ -1334,7 +1457,7 @@ def main():
         a.seeds = 3 if a.cmd == "trials" else 5
     _RATE_LIMITER.min_interval = a.stagger
     {"smoke": cmd_smoke, "mock": cmd_mock, "calib": cmd_calib, "debate": cmd_debate,
-     "trials": cmd_trials, "report": cmd_report}[a.cmd](a)
+     "trials": cmd_trials, "report": cmd_report, "resample": cmd_resample}[a.cmd](a)
 
 
 if __name__ == "__main__":

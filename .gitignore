@@ -5,3 +5,8 @@ summary*.md
 *.env
 .DS_Store
 calls.jsonl
+gpqa_diamond.jsonl
+gpqa.jsonl
+gpqa_fix.jsonl
+resample.jsonl
+gpqa_summary.json
