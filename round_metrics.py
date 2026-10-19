@@ -9,7 +9,7 @@ For each policy, on problems where the debate ran, round by round:
   agents right mean number of agents (out of 5) holding the right answer
   speaker right share of rounds where the chosen speaker held the right answer
   switches     agents that changed answer this round: wrong->right, right->wrong, wrong->other wrong
-  followed     share of switches that moved to the answer the previous speaker argued
+  followed     share of switches that moved to an answer argued by the previous round's speaker(s)
 """
 import json, sys, os
 from collections import defaultdict, Counter
@@ -58,21 +58,21 @@ def main(path, contested_only=False):
                 cur = {a: v[min(k, len(v) - 1)][0] for a, v in R.items()}   # stopped early -> carry last
                 vote += majority_right(list(cur.values()), truth)
                 agents += sum(answers_match(x, truth) for x in cur.values())
-                if k < len(spk):                                            # speaker chosen in round k
-                    s = spk[k]; spk_n += 1
+                srd = r["canon"].get("speaker_rounds") or list(range(len(spk)))  # older runs: one per round
+                at = lambda rr: [x for x, q in zip(spk, srd) if q == rr]          # speakers chosen in round rr
+                for s in at(k):
+                    spk_n += 1
                     spk_ok += answers_match(R[s][min(k, len(R[s]) - 1)][0], truth)
                 if k > 0:
                     prev = {a: v[min(k - 1, len(v) - 1)][0] for a, v in R.items()}
-                    said = None
-                    if k - 1 < len(spk):
-                        s = spk[k - 1]; said = R[s][min(k - 1, len(R[s]) - 1)][0]
+                    said = [R[s][min(k - 1, len(R[s]) - 1)][0] for s in at(k - 1)]
                     for a in R:
                         if answers_match(prev[a], cur[a]):
                             continue
                         was, now = answers_match(prev[a], truth), answers_match(cur[a], truth)
                         sw["W->R" if now else ("R->W" if was else "W->W")] += 1
-                        if said is not None:
-                            fol_n += 1; fol += answers_match(cur[a], said)
+                        if said:
+                            fol_n += 1; fol += any(answers_match(cur[a], x) for x in said)
             n = len(rs)
             sp = f"{spk_ok / spk_n:.1%}" if spk_n else "-"
             fl = f"{fol / fol_n:.0%}" if fol_n else "-"
