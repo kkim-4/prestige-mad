@@ -1,165 +1,155 @@
 # Prestige-Weighted, Confidence-Scored Multi-Agent Debate
 
-Does it help a group of LLM agents to let the agent with the best track record
-and the strongest confidence speak, instead of taking turns? This repo tests
-**prestige × confidence** speaker selection against **round-robin** debate on
-MATH and GPQA-Diamond, with agents of the same model.
+Does a group of LLM agents answer better when the agents with the best track record and the
+strongest confidence decide who speaks, instead of taking turns? This repo compares
+**prestige × confidence** speaker policies with **round-robin** debate and **majority vote**
+on MATH and GPQA, using five agents of the same model (gemini-3.1-flash-lite).
 
-One script (`mad_gemini.py`) on the Gemini API, plain Python.
+**Current best policy: `dual`.** After round 1, the top prestige × confidence agent and the
+strongest agent holding a different answer speak together. It came out ahead of round robin in
+every paired run (+2 to +3 points), with about half the flips, and beats majority vote.
+Pooled over three runs it wins 32 problems to 15 (one-sided p = 0.009); the single planned
+confirmation run was not significant on its own (p = 0.20).
 
 ## How it works
 
-- 5 agents (one model, personas: careful, fast, skeptic, teacher, contrarian) solve a
-  problem. Round 1 is independent; in later rounds each agent sees a transcript of
-  who spoke and may revise. Each turn returns JSON: answer, confidence, key uncertainty.
-- Each round the **policy** picks one speaker. The final answer is a vote over
-  last-round answers (unweighted for round robin, weighted otherwise).
-- **Prestige** = each agent's running Brier score on its independent round-1 answers,
-  pulled toward 0.5. Problem *i* uses only earlier problems: no warmup, every problem scored.
-- **Self-consistency confidence** (`--sc-k 3`): each agent answers round 1 three times;
-  confidence = share of samples agreeing with its modal answer. `--sc-carry` carries it into
-  later rounds (share of the agent's own round-1 samples matching its current answer).
-- **Stability:** each debate is rerun with the agents reordered; a changed final answer is a flip.
-- All policies share the same round-1 answers, so comparisons are paired.
+- **Agents.** 5 agents, one model, personas: careful, fast, skeptic, teacher, contrarian.
+  Each turn returns JSON: answer, confidence, key uncertainty, short rationale.
+- **Round 1** is independent. Each agent answers 3 times (`--sc-k 3`); its answer is the most
+  common one, and its **confidence** averages the share of samples that agree (3/3, 2/3, 1/3)
+  with its stated confidence (`--conf-mix avg`).
+- **Prestige** is each agent's running Brier score, 1 − (confidence − correct)², on its
+  round-1 answers to *earlier* problems, pulled toward 0.5 (prior strength 5). No warmup:
+  every problem is scored. `--warmup-from` can start it from separate problems.
+- **Debate.** Up to 3 rounds; only when first answers disagree (`--stop-unanimous`). Each round
+  the policy chooses who speaks; everyone sees the transcript and may revise.
+- **Stability.** Every debate is rerun with the agents reordered; a changed answer is a flip.
+- **Paired design.** All policies in a run share the same round-1 answers.
 
-| Policy | Speaker / vote weight |
-|---|---|
-| `round_robin` | rotate speaker, unweighted vote |
-| `prestige_x_conf` | prestige × confidence (proposed) |
-| `conf_only` | confidence alone |
-| `prestige_only` | prestige alone |
-| `both_sides` | top prestige × confidence agent speaks first, then the top-ranked agent holding a different answer |
+| Policy | Who speaks | Final answer |
+|---|---|---|
+| `round_robin` | one agent per round, in turn | majority |
+| `prestige_x_conf` | highest prestige × confidence | weighted vote |
+| `both_sides` | top agent, then top agent with a different answer | weighted vote |
+| **`dual`** (v3+) | **top agent and top dissenter together after round 1**, then any answer not yet argued | majority, prestige × confidence breaks ties |
+| `rr_dual` (v3+) | same airtime as `dual` (2 then 1), by rotation: the control | majority |
+| `pool_dual` (v4) | best argument for the top two answers across all 15 round-1 samples | majority |
+| `conf_only`, `prestige_only` | ablations | weighted vote |
 
 ## Setup
 
 ```bash
-pip install -r requirements.txt   # google-genai, pydantic, sympy (sympy is needed for grading)
-
-# Vertex AI
-gcloud auth application-default login
-export GOOGLE_GENAI_USE_VERTEXAI=True GOOGLE_CLOUD_PROJECT=your-project GOOGLE_CLOUD_LOCATION=us-east4
-# or the Developer API
-export GEMINI_API_KEY=...
+pip install -r requirements.txt   # google-genai, pydantic, sympy
+export GEMINI_API_KEY=...          # or Vertex AI: GOOGLE_GENAI_USE_VERTEXAI=True GOOGLE_CLOUD_PROJECT=... GOOGLE_CLOUD_LOCATION=...
 ```
+
+Data: `math.jsonl` (MATH-500); `python3 make_math_extra.py` builds 4,500 unseen MATH problems;
+`python3 make_gpqa.py` builds GPQA-Diamond and `--subset main_minus_diamond` 250 more GPQA
+questions (gated: accept the terms on Hugging Face and log in with `hf auth login`).
+**GPQA files are kept out of this repo**, because GPQA asks that its questions not be published.
 
 ## Usage
 
 ```bash
-# Experiment 2 (self-consistency); --dry-run prints the plan and call count first
-python3 mad_gemini.py trials --problems math.jsonl --n 230 --offset 100 --seeds 3 \
-  --model gemini-3.1-flash-lite --sc-k 3 --sc-carry --rounds 3 \
-  --policies round_robin,prestige_x_conf,conf_only --stop-unanimous \
-  --stagger 0.3 --workers 6 --store sc.jsonl --dry-run
+# one experiment: round robin vs dual (majority vote is printed automatically)
+python3 mad_gemini_v4.py trials --problems gpqa_main_extra.jsonl --n 250 --seeds 1 \
+  --model gemini-3.1-flash-lite --sc-k 3 --sc-carry --rounds 3 --policies round_robin,dual \
+  --conf-mix avg --stop-unanimous --stagger 0.3 --workers 4 --store run.jsonl --dry-run
 
-# Regrade and summarize stored results (no API calls); several stores can be combined
-python3 mad_gemini.py report --store sc.jsonl --policies round_robin,prestige_x_conf,conf_only
+python3 mad_gemini_v4.py report --store run.jsonl --policies round_robin,dual   # no API calls
 ```
 
-- `trials` is resumable: rerun the same command after a crash or Ctrl-C.
-- `--round1-only` collects first answers only (a cheap confidence check); rerun without it to debate.
-- `--stop-unanimous` debates only problems where first answers disagree.
-- `--panel` sets a model per agent; `--mock` runs simulated agents with no API calls.
-- `--conf-mix avg` averages self-consistency with stated confidence; `--init-from` reuses another run's round-1 answers.
-- `python3 mad_gemini.py resample --store sc.jsonl` reruns debated problems with the same agent order and fresh calls
-  (a stability test that doesn't depend on reordering).
-- `make_math_extra.py` builds unseen problems from the full MATH test set (minus MATH-500);
-  `make_gpqa.py` builds GPQA-Diamond (gated: accept its terms on Hugging Face first).
-- `free_analyses.py` and `contested_breakdown.py` run extra paired tests on a stored run, with no API calls.
-- `signal_check.py` tests whether confidence and prestige carry signal (agent differences, within-problem AUROC,
-  speaker choice with warmup and oracle prestige); `round_metrics.py` prints per-round accuracy, switches and
-  speaker-following for runs made with the current script (every agent's answer is now stored per round).
-- `--warmup-from W.jsonl [--warmup-n N]` starts prestige from round-1 answers on separate problems (collect them with
-  `--round1-only`); results are labelled `<policy>_warmN`. `make_gpqa.py --subset main_minus_diamond` builds warmup questions.
+- `--dry-run` prints the call count and cost first. Runs are resumable: rerun the same command.
+- `--init-from other.jsonl` reuses another run's round-1 answers (same problems, no new round-1 cost).
+- `--warmup-from W.jsonl --warmup-n N` starts prestige from round-1 answers on separate problems.
+- `run_experiment.sh` wraps one experiment (dry run, run, report); scale with `N=`, `LEVEL=`, `PROBLEMS=`.
 
-`report` prints per-agent accuracy, a confidence check (AUROC), no-debate baselines,
-accuracy and flip rates per policy, paired bootstrap CIs, McNemar's exact test, and a
-speaker analysis.
+Analysis scripts (no API calls):
+
+| Script | What it shows |
+|---|---|
+| `revote.py` | plain majority vs stored vote; how many agents switched to right vs wrong answers |
+| `round_metrics.py` | per round: majority accuracy, agents right, speaker right, switches, who followed whom |
+| `signal_check.py` | whether agents differ (Cochran's Q) and whether confidence picks the right agent within a problem |
+| `free_analyses.py`, `contested_breakdown.py` | extra paired tests on older runs |
 
 ## Results (gemini-3.1-flash-lite)
 
-**Experiment 1: MATH, stated confidence, problems 1–100, 3 seeds, every problem debated.**
+"Contested" = some agents right and some wrong after round 1. McNemar counts are problems one
+policy got right and the other wrong.
 
-| Method | Accuracy | Flip |
-|---|---|---|
-| Majority vote, no debate | 85.3% | – |
-| Round robin | **88.3%** | 9.7% |
-| Prestige × confidence | 86.0% | 6.7% |
+### 1. dual vs round robin and majority vote
 
-Accuracy −2.3 points [−5.7, +0.3], n.s. Stated confidence sat at 0.99, so the policy had
-no per-problem signal and mostly gave the floor to the confident majority.
+| Run | Majority vote | Round robin | **dual** | dual vs RR (McNemar) | Contested: RR → dual |
+|---|---|---|---|---|---|
+| MATH 101–330, seed 0 | 83.0% | 85.7% | **88.3%** | 9 vs 3 (p = 0.15) | 64% → 86% |
+| GPQA-Diamond (198), fresh round 1 | 67.7% | 67.7% | **70.7%** | 9 vs 3 (p = 0.15) | 50% → 64% |
+| GPQA main minus Diamond (250), planned test | 64.0% | 64.8% | **66.8%** | 14 vs 9 (one-sided p = 0.20) | 60% → 65% |
+| **Pooled** | | | | **32 vs 15** (one-sided p = 0.009) | |
 
-**Experiment 2: MATH, self-consistency confidence, problems 101–330, 3 seeds, debate on disagreement.**
+- **Fewer flips** in every run: 3.5–5.6% for dual vs 8.3–12.8% for round robin (significant on GPQA main, −7.2 points).
+- **Choosing the voices matters.** `rr_dual` gets the same airtime by rotation and reached only
+  86.1% on MATH (5 vs 4 against round robin), against 88.3% for `dual`.
+- **Why it works:** in round 2, agents switched to the right answer far more often than away
+  from it: 2.7 to 1 on GPQA (round robin 1.5 to 1) and 5.8 to 1 on MATH (rotation 4.0 to 1).
+  Hearing the leader and the strongest dissenter side by side is what converts agents.
+- **Caveats.** The pooled test was computed after seeing the runs; the planned test alone was
+  underpowered. An effect of about +2 points needs roughly 600–800 problems to confirm in one run.
+
+### 2. Earlier policies
+
+**MATH 101–330, 3 seeds** (all rows regraded with the current grader):
 
 | Method | Accuracy | Flip | Correct → wrong |
 |---|---|---|---|
-| Majority vote, no debate | 82.9% | – | – |
-| Round robin | **84.9%** | 8.6% | 2.5% |
-| Confidence only | 84.1% | 4.5% | 1.3% |
-| Prestige × confidence | 84.3% | **1.6%** | **0.3%** |
-| Both sides (`--conf-mix avg`, run later on the same round-1 answers) | **86.8%** | 5.1% | 1.4% |
+| Majority vote, no debate | 83.3% | – | – |
+| Round robin | 85.4% | 8.6% | 2.5% |
+| Confidence only | 84.5% | 4.5% | 1.3% |
+| Prestige × confidence | 84.8% | **1.6%** | **0.3%** |
+| Both sides | **86.8%** | 5.1% | 1.4% |
 
-- **Accuracy (primary): no difference.** −0.6 points [−2.0, +0.7]; McNemar 12 vs 16, p = 0.57.
-- **Confidence works:** 3/3 agreeing samples were right 93% of the time, 2/3 52%, 1/3 13% (AUROC 0.80).
-- **Better speakers:** the first speaker held the right answer 44% of the time vs 34% for round robin.
-- **Fewer flips under reordering** (−7.0 points [−9.6, −4.5]), but much of this is by design:
-  round robin's speaker is set by agent order, prestige × confidence's by content.
-- **Little headroom:** all agents were wrong on 12.3% of problem-runs, capping accuracy near 88%.
-- **Debate beats voting:** round robin +2.0 points over the no-debate majority vote (p = 0.009),
-  all from the 19% of problems where first answers differ.
-- **Prestige adds stability beyond confidence:** 2.9 points fewer flips than confidence only [−4.8, −1.2], same accuracy.
-- **Both sides beats round robin (borderline):** +1.4 points [+0.0, +2.9]; McNemar 19 vs 9, p = 0.087; contested
-  accuracy 80.4% vs 72.2%. Designed on GPQA, so semi-out-of-sample here. (A later report regrades all rows about
-  0.5 points higher, e.g. round robin 85.4%; paired comparisons are unchanged.)
+Both sides vs round robin: +1.4 [+0.0, +2.9], McNemar 19 vs 9, p = 0.087; contested 80.4% vs 72.2%.
 
-**Experiment 3: GPQA-Diamond (198 questions), 1 seed, same setup as experiment 2.**
+**GPQA-Diamond, first round-1 set:** round robin 71.2%, prestige × confidence 67.7% (2 vs 9),
+both sides 70.2%, v2 70.7% (tie with a 70.7% rerun), dual 70.7%, rr_dual 71.2%.
 
-| Method | Accuracy | Contested (42) | Flip |
-|---|---|---|---|
-| Majority vote, no debate | 65.7% | – | – |
-| Round robin | **71.2%** | **66.7%** | 13.6% |
-| Prestige × confidence | 67.7% | 52.4% | 0.0% |
-| Both sides (`--conf-mix avg`) | 70.2% | 61.9% | 5.6% |
+### 3. What prestige and confidence can and can't do
 
-- **Plain prestige × confidence lost** (−3.5 points, McNemar p = 0.065): self-consistency is weak on
-  multiple choice (AUROC 0.66), so a confidently wrong leader went unchallenged.
-- **Both sides ties round robin** (−1.0 [−4.0, +2.0], p = 0.75) with significantly fewer flips (−8.1 points)
-  and correct → wrong reversals (−4.5). Exploratory: designed on these same problems.
+- **The agents are not reliably different** (Cochran's Q: p = 0.18 GPQA, 0.47 MATH); prestige
+  ends within 0.03 across agents, so it mostly breaks ties.
+- **Warmup doesn't help.** On GPQA main, dual with prestige warmed up on 0, 50 and 198 separate
+  questions scored 66.8%, 66.4% and 67.6%, and first-speaker accuracy stayed at 42–45%.
+- **Confidence picks the right agent on MATH, not on GPQA.** Within a contested problem, a right
+  agent is more confident than a wrong one 69% of the time on MATH and 51% on GPQA.
+- **Vote rule barely matters**: a plain majority changes results by 0–3 problems.
+- **`pool_dual` did not help** (68.7% vs 67.7% on GPQA-Diamond): its round-3 speaker revived
+  answers that were mostly wrong.
+- **Round 3 is mixed**: it cost dual 2 problems on GPQA and gained 3 on MATH.
 
-- **v2** (`mad_gemini_v2.py`: calibrated confidence, challenger, explore, verify prompt): 70.7% vs 70.7% for a
-  round-robin rerun (McNemar 5 vs 5); flips 3.0% vs 11.1%, correct → wrong 0 vs 9 problems.
-
-**Why GPQA ties and MATH wins** (`signal_check.py`, no API calls): the five agents are not reliably different
-(Cochran's Q p = 0.18 GPQA, 0.47 MATH), so prestige has little to learn. Within a contested problem, a right agent
-is more confident than a wrong one 69% of the time on MATH but 51% on GPQA, and the plain majority is right on only
-46% of contested GPQA problems. Speaker choice can only help where confidence identifies the right agent.
-
-**Takeaway:** letting the most credible dissenter answer the leader (both sides) turns prestige × confidence from a
-tie into a borderline win on MATH and a tie with far fewer flips on GPQA. It needs a fresh confirmatory run.
-
-Earlier single-run results (76.7% for both policies) are superseded; they used a faulty
-grader and a 40% warmup.
+**Takeaway:** with identical agents, the gain comes from debate *structure* (letting the leader
+and the strongest dissenter speak together), not from prestige telling agents apart.
 
 ## Repo layout
 
 | Path | Contents |
 |---|---|
-| `mad_gemini.py` | Agents, policies, `trials` / `report` commands, grader |
-| `make_math_extra.py`, `make_gpqa.py` | Build unseen MATH test problems / GPQA-Diamond |
-| `mad_gemini_v2.py` | Adds the `v2` calibrated-challenge policy (`--verify`, `--explore-below`) |
-| `free_analyses.py`, `contested_breakdown.py`, `signal_check.py`, `round_metrics.py` | Extra analyses on stored runs (no API calls) |
-| `mad_gemini_independent_personas.py` | Earlier independent-personas variant, kept for reference |
-| `runs/<date>_<name>/` | Raw results (`*.jsonl`, regradable with `report`) and summaries per experiment. GPQA raw files are kept out of the repo because GPQA asks that its questions not be published in plain text. |
+| `mad_gemini_v4.py` | current script: all policies, warmup, per-round logging, `pool_dual` |
+| `mad_gemini_v3.py` | adds `dual` / `rr_dual` (same as v4 without `pool_dual`) |
+| `mad_gemini.py`, `mad_gemini_v2.py` | earlier versions (v2: calibrated-challenge policy) |
+| `make_math_extra.py`, `make_gpqa.py` | build MATH and GPQA problem files |
+| `revote.py`, `round_metrics.py`, `signal_check.py`, `free_analyses.py`, `contested_breakdown.py` | analyses, no API calls |
+| `run_experiment.sh` | one-command experiment runner |
+| `runs/<date>_<name>/` | MATH results (`*.jsonl`, regradable with `report`) and summaries |
 
 ## Next steps
 
-- Confirm `both_sides` vs round robin on fresh MATH problems (`math_extra.jsonl`), with the analysis fixed in advance.
-- Warmup test: does an established prestige change speaker choice (expected: little, since the agents are similar)?
-- Separate its two changes: combined confidence vs the both-sides speaker rule.
-- Resampling stability results (same agent order, fresh calls).
-- Let speakers show their full working instead of 3 sentences.
-- Mixed-skill panel, where prestige has real reliability differences to learn.
+- One planned, adequately powered test of dual vs round robin (about 500–800 fresh MATH or GPQA problems).
+- A mixed-skill panel, where prestige has real differences to learn.
+- A better within-problem signal for hard questions (e.g., agents rating each other's arguments).
 
 ## Known issues
 
-- Vertex AI connections drop intermittently; retries with jittered backoff absorb them.
+- Gemini returns occasional 503 errors; the script retries automatically (`attempt 1/5` is normal).
 - Five MATH-500 problems are skipped because their reference answer can't be parsed.
+- When several stores are combined in `report`, shared round-1 answers are counted once per store
+  in the round-1 summary; policy comparisons are unaffected.
