@@ -13,3 +13,6 @@ gpqa_summary.json
 gpqa_main_extra.jsonl
 gpqa_warm*.jsonl
 *_s0.jsonl
+gpqa_main_extra.jsonl
+gpqa_warm*.jsonl
+*_s0.jsonl

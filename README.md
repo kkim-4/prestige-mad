@@ -65,6 +65,11 @@ python3 mad_gemini.py report --store sc.jsonl --policies round_robin,prestige_x_
 - `make_math_extra.py` builds unseen problems from the full MATH test set (minus MATH-500);
   `make_gpqa.py` builds GPQA-Diamond (gated: accept its terms on Hugging Face first).
 - `free_analyses.py` and `contested_breakdown.py` run extra paired tests on a stored run, with no API calls.
+- `signal_check.py` tests whether confidence and prestige carry signal (agent differences, within-problem AUROC,
+  speaker choice with warmup and oracle prestige); `round_metrics.py` prints per-round accuracy, switches and
+  speaker-following for runs made with the current script (every agent's answer is now stored per round).
+- `--warmup-from W.jsonl [--warmup-n N]` starts prestige from round-1 answers on separate problems (collect them with
+  `--round1-only`); results are labelled `<policy>_warmN`. `make_gpqa.py --subset main_minus_diamond` builds warmup questions.
 
 `report` prints per-agent accuracy, a confidence check (AUROC), no-debate baselines,
 accuracy and flip rates per policy, paired bootstrap CIs, McNemar's exact test, and a
@@ -91,6 +96,7 @@ no per-problem signal and mostly gave the floor to the confident majority.
 | Round robin | **84.9%** | 8.6% | 2.5% |
 | Confidence only | 84.1% | 4.5% | 1.3% |
 | Prestige × confidence | 84.3% | **1.6%** | **0.3%** |
+| Both sides (`--conf-mix avg`, run later on the same round-1 answers) | **86.8%** | 5.1% | 1.4% |
 
 - **Accuracy (primary): no difference.** −0.6 points [−2.0, +0.7]; McNemar 12 vs 16, p = 0.57.
 - **Confidence works:** 3/3 agreeing samples were right 93% of the time, 2/3 52%, 1/3 13% (AUROC 0.80).
@@ -101,6 +107,9 @@ no per-problem signal and mostly gave the floor to the confident majority.
 - **Debate beats voting:** round robin +2.0 points over the no-debate majority vote (p = 0.009),
   all from the 19% of problems where first answers differ.
 - **Prestige adds stability beyond confidence:** 2.9 points fewer flips than confidence only [−4.8, −1.2], same accuracy.
+- **Both sides beats round robin (borderline):** +1.4 points [+0.0, +2.9]; McNemar 19 vs 9, p = 0.087; contested
+  accuracy 80.4% vs 72.2%. Designed on GPQA, so semi-out-of-sample here. (A later report regrades all rows about
+  0.5 points higher, e.g. round robin 85.4%; paired comparisons are unchanged.)
 
 **Experiment 3: GPQA-Diamond (198 questions), 1 seed, same setup as experiment 2.**
 
@@ -116,8 +125,16 @@ no per-problem signal and mostly gave the floor to the confident majority.
 - **Both sides ties round robin** (−1.0 [−4.0, +2.0], p = 0.75) with significantly fewer flips (−8.1 points)
   and correct → wrong reversals (−4.5). Exploratory: designed on these same problems.
 
-**Takeaway:** prestige × confidence matches round-robin accuracy with much more stable outcomes, as long as
-a confidently wrong leader gets challenged. It does not yet get more answers right.
+- **v2** (`mad_gemini_v2.py`: calibrated confidence, challenger, explore, verify prompt): 70.7% vs 70.7% for a
+  round-robin rerun (McNemar 5 vs 5); flips 3.0% vs 11.1%, correct → wrong 0 vs 9 problems.
+
+**Why GPQA ties and MATH wins** (`signal_check.py`, no API calls): the five agents are not reliably different
+(Cochran's Q p = 0.18 GPQA, 0.47 MATH), so prestige has little to learn. Within a contested problem, a right agent
+is more confident than a wrong one 69% of the time on MATH but 51% on GPQA, and the plain majority is right on only
+46% of contested GPQA problems. Speaker choice can only help where confidence identifies the right agent.
+
+**Takeaway:** letting the most credible dissenter answer the leader (both sides) turns prestige × confidence from a
+tie into a borderline win on MATH and a tie with far fewer flips on GPQA. It needs a fresh confirmatory run.
 
 Earlier single-run results (76.7% for both policies) are superseded; they used a faulty
 grader and a 40% warmup.
@@ -128,13 +145,15 @@ grader and a 40% warmup.
 |---|---|
 | `mad_gemini.py` | Agents, policies, `trials` / `report` commands, grader |
 | `make_math_extra.py`, `make_gpqa.py` | Build unseen MATH test problems / GPQA-Diamond |
-| `free_analyses.py`, `contested_breakdown.py` | Extra paired tests on stored runs (no API calls) |
+| `mad_gemini_v2.py` | Adds the `v2` calibrated-challenge policy (`--verify`, `--explore-below`) |
+| `free_analyses.py`, `contested_breakdown.py`, `signal_check.py`, `round_metrics.py` | Extra analyses on stored runs (no API calls) |
 | `mad_gemini_independent_personas.py` | Earlier independent-personas variant, kept for reference |
 | `runs/<date>_<name>/` | Raw results (`*.jsonl`, regradable with `report`) and summaries per experiment. GPQA raw files are kept out of the repo because GPQA asks that its questions not be published in plain text. |
 
 ## Next steps
 
-- Confirm `both_sides` vs round robin on fresh hard problems, with the analysis fixed in advance.
+- Confirm `both_sides` vs round robin on fresh MATH problems (`math_extra.jsonl`), with the analysis fixed in advance.
+- Warmup test: does an established prestige change speaker choice (expected: little, since the agents are similar)?
 - Separate its two changes: combined confidence vs the both-sides speaker rule.
 - Resampling stability results (same agent order, fresh calls).
 - Let speakers show their full working instead of 3 sentences.
