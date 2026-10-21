@@ -71,6 +71,7 @@ Analysis scripts (no API calls):
 | `revote.py` | plain majority vs stored vote; how many agents switched to right vs wrong answers |
 | `round_metrics.py` | per round: majority accuracy, agents right, speaker right, switches, who followed whom |
 | `signal_check.py` | whether agents differ (Cochran's Q) and whether confidence picks the right agent within a problem |
+| `mechanism_check.py` | dual's debates split by which round-1 speaker was right, and how the group moved |
 | `free_analyses.py`, `contested_breakdown.py` | extra paired tests on older runs |
 
 ## Results (gemini-3.1-flash-lite)
@@ -93,6 +94,11 @@ policy got right and the other wrong.
 - **Why it works:** in round 2, agents switched to the right answer far more often than away
   from it: 2.7 to 1 on GPQA (round robin 1.5 to 1) and 5.8 to 1 on MATH (rotation 4.0 to 1).
   Hearing the leader and the strongest dissenter side by side is what converts agents.
+- **A right minority wins the group over** (`mechanism_check.py`). When dual's leader was wrong and
+  its dissenter right, agents holding the right answer went from about 1.5 to about 3.5 of 5 in
+  round 2 on all three datasets (GPQA-Diamond 1.45 → 3.68, GPQA main 1.86 → 3.21, MATH 1.61 → 3.61),
+  and the final answer was right in 52–72% of those debates. When the dissenter was wrong, agents
+  mostly held their ground. The leader was wrong in over half of dual's debates.
 - **Caveats.** The pooled test was computed after seeing the runs; the planned test alone was
   underpowered. An effect of about +2 points needs roughly 600–800 problems to confirm in one run.
 
@@ -137,7 +143,7 @@ and the strongest dissenter speak together), not from prestige telling agents ap
 | `mad_gemini_v3.py` | adds `dual` / `rr_dual` (same as v4 without `pool_dual`) |
 | `mad_gemini.py`, `mad_gemini_v2.py` | earlier versions (v2: calibrated-challenge policy) |
 | `make_math_extra.py`, `make_gpqa.py` | build MATH and GPQA problem files |
-| `revote.py`, `round_metrics.py`, `signal_check.py`, `free_analyses.py`, `contested_breakdown.py` | analyses, no API calls |
+| `revote.py`, `round_metrics.py`, `signal_check.py`, `mechanism_check.py`, `free_analyses.py`, `contested_breakdown.py` | analyses, no API calls |
 | `run_experiment.sh` | one-command experiment runner |
 | `runs/<date>_<name>/` | MATH results (`*.jsonl`, regradable with `report`) and summaries |
 
