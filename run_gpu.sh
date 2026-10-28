@@ -10,7 +10,7 @@
 #   bash run_gpu.sh
 #   MODEL=google/gemma-3-12b-it bash run_gpu.sh
 #   MODEL=Qwen/Qwen3-8B EXTRA='{"chat_template_kwargs":{"enable_thinking":false}}' bash run_gpu.sh
-#   PROBLEMS=gpqa_extended.jsonl N=546 LEVEL= bash run_gpu.sh
+#   PROBLEMS=gpqa_extended.jsonl N=546 LEVEL= SEEDS=3 bash run_gpu.sh   # GPQA (python3 make_gpqa.py --subset extended)
 #
 # Calls cost nothing per token here; the limit is GPU time. Results are resumable: rerun the
 # same command after a crash. Each model gets its own store (named after the model).
@@ -21,6 +21,7 @@ PROBLEMS=${PROBLEMS:-math_extra.jsonl}
 N=${N:-600}
 LEVEL=${LEVEL-4,5}
 POLICIES=${POLICIES:-round_robin,dual,seq_dual,diss_only,lead_rand,dual_randdiss,rr_dual}
+SEEDS=${SEEDS:-1}
 WORKERS=${WORKERS:-32}
 MAXLEN=${MAXLEN:-8192}
 EXTRA=${EXTRA:-}
@@ -42,7 +43,7 @@ if ! curl -s "localhost:$PORT/v1/models" >/dev/null 2>&1; then
   done
 fi
 
-ARGS=(--backend openai --model "$MODEL" --problems "$PROBLEMS" --n "$N" --seeds 1
+ARGS=(--backend openai --model "$MODEL" --problems "$PROBLEMS" --n "$N" --seeds "$SEEDS"
       --sc-k 3 --sc-carry --rounds 3 --conf-mix avg --stop-unanimous
       --policies "$POLICIES" --stagger 0 --workers "$WORKERS" --price-per-call 0 --store "$STORE")
 [[ -n "$LEVEL" ]] && ARGS+=(--level "$LEVEL")
