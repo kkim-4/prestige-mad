@@ -74,6 +74,56 @@ Analysis scripts (no API calls):
 | `mechanism_check.py` | dual's debates split by which round-1 speaker was right, and how the group moved |
 | `free_analyses.py`, `contested_breakdown.py` | extra paired tests on older runs |
 
+## Powered confirmation and open models (v5)
+
+`mad_gemini_v5.py` adds the mechanism ablations and an open-model backend. The plan is fixed in
+`PREREG.md` (commit it before running).
+
+```bash
+bash run_confirmation.sh primary     # Gemini: round robin vs dual on 600 fresh MATH level 4-5 problems
+bash run_confirmation.sh ablations   # + seq_dual, diss_only, lead_rand, dual_randdiss, rr_dual (same round 1)
+bash run_confirmation.sh gpqa        # replication on GPQA extended (546)
+bash run_gpu.sh                      # same experiment on a GPU with vLLM (default Qwen2.5-7B-Instruct)
+MODEL=google/gemma-3-12b-it bash run_gpu.sh
+```
+
+| Ablation | Change from `dual` | Question |
+|---|---|---|
+| `seq_dual` | dissenter speaks a round after the leader | does simultaneity matter? |
+| `diss_only` | only the dissenter speaks | is the minority's case enough? |
+| `lead_rand` | leader + random agent, any answer | does it need a real dissenter? |
+| `dual_randdiss` | leader + random agent with a different answer | does choosing the dissenter matter? |
+| `rr_dual` | two speakers by rotation | same airtime, no choosing, no guaranteed dissent |
+
+`--backend openai` works with any OpenAI-compatible server (vLLM, SGLang, Ollama); see `run_gpu.sh`.
+
+**No GPU? Use `--provider`** for hosted or local open models (implies `--backend openai`):
+
+| `--provider` | Service | Key variable |
+|---|---|---|
+| `ollama` | Ollama on your own machine (`ollama serve`) | none |
+| `ollama_cloud` | Ollama cloud models | `OLLAMA_API_KEY` |
+| `openrouter` | OpenRouter (free models end in `:free`) | `OPENROUTER_API_KEY` |
+| `groq` | Groq | `GROQ_API_KEY` |
+| `together` | Together AI | `TOGETHER_API_KEY` |
+| `hf` | Hugging Face Inference Providers | `HF_TOKEN` |
+| `deepinfra` | DeepInfra | `DEEPINFRA_API_KEY` |
+
+```bash
+export OPENROUTER_API_KEY=...
+python3 mad_gemini_v5.py smoke --provider openrouter --model <model id from the provider's site>
+python3 mad_gemini_v5.py trials --provider openrouter --model <model id> --problems math_extra.jsonl \
+  --level 4,5 --n 30 --seeds 1 --sc-k 3 --sc-carry --rounds 3 --policies round_robin,dual \
+  --conf-mix avg --stop-unanimous --stagger 3 --workers 2 --max-retries 8 --price-per-call 0 --store pilot.jsonl
+```
+
+Free tiers are rate-limited (requests per minute and per day): set `--stagger` to about
+60 / (allowed requests per minute). A full 600-problem run needs tens of thousands of calls, so free
+tiers suit pilots; full runs need a paid tier, your own GPU (`run_gpu.sh`) or local Ollama.
+If a service rejects JSON-schema output, the script falls back to plain JSON automatically.
+Use `--openai-extra '{"chat_template_kwargs":{"enable_thinking":false}}'` for Qwen3, and
+`--schema-mode guided_json` (or `none`) if a server rejects JSON-schema output.
+
 ## Results (gemini-3.1-flash-lite)
 
 "Contested" = some agents right and some wrong after round 1. McNemar counts are problems one
@@ -139,12 +189,13 @@ and the strongest dissenter speak together), not from prestige telling agents ap
 
 | Path | Contents |
 |---|---|
-| `mad_gemini_v4.py` | current script: all policies, warmup, per-round logging, `pool_dual` |
+| `mad_gemini_v5.py` | current script: v4 + mechanism ablations + open-model backend (`--backend openai`) |
+| `mad_gemini_v4.py` | all policies, warmup, per-round logging, `pool_dual` |
 | `mad_gemini_v3.py` | adds `dual` / `rr_dual` (same as v4 without `pool_dual`) |
 | `mad_gemini.py`, `mad_gemini_v2.py` | earlier versions (v2: calibrated-challenge policy) |
 | `make_math_extra.py`, `make_gpqa.py` | build MATH and GPQA problem files |
 | `revote.py`, `round_metrics.py`, `signal_check.py`, `mechanism_check.py`, `free_analyses.py`, `contested_breakdown.py` | analyses, no API calls |
-| `run_experiment.sh` | one-command experiment runner |
+| `run_experiment.sh`, `run_confirmation.sh`, `run_gpu.sh`, `PREREG.md` | experiment runners and the pre-registered confirmation plan |
 | `runs/<date>_<name>/` | MATH results (`*.jsonl`, regradable with `report`) and summaries |
 
 ## Next steps
