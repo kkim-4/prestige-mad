@@ -124,6 +124,23 @@ If a service rejects JSON-schema output, the script falls back to plain JSON aut
 Use `--openai-extra '{"chat_template_kwargs":{"enable_thinking":false}}'` for Qwen3, and
 `--schema-mode guided_json` (or `none`) if a server rejects JSON-schema output.
 
+## Mixed-skill panels (`mad_dual.py`)
+
+Clone agents give prestige nothing to learn, so `mad_dual.py` adds panels whose agents really differ
+(plan in `PREREG_mixed.md`):
+
+| Version | Run | Panel | Needs |
+|---|---|---|---|
+| v7 | `bash run_dual_sizes.sh` | Qwen2.5 1.5B / 3B / 7B / 14B / 32B | 2 x 80 GB GPUs (`ONE_GPU=1`: 0.5B-14B on one) |
+| v8 | `bash run_dual_expert.sh` | 1 strong + 4 weak Gemini models | Vertex only, no GPU |
+| v8 open | `OPEN=1 bash run_dual_expert.sh` | Qwen2.5-14B + 4 x Qwen2.5-1.5B | one GPU |
+
+New controls: `dual_shuf` (prestige randomly reassigned, tests whether learned prestige matters) and
+`mixed_report.py` (per-agent accuracy, calibration and prestige; every policy vs the expert alone).
+`serve_models.sh` starts several vLLM servers on chosen GPUs. A custom panel goes in a JSON file
+(`--panel-file`), one entry per agent: `{"id", "model", "backend": "gemini"|"openai", "base_url" or
+"provider", "thinking", "role"}`.
+
 ## Results (gemini-3.1-flash-lite)
 
 "Contested" = some agents right and some wrong after round 1. McNemar counts are problems one
