@@ -3,13 +3,20 @@
 Does a group of LLM agents answer better when the agents with the best track record and the
 strongest confidence decide who speaks, instead of taking turns? This repo compares
 **prestige × confidence** speaker policies with **round-robin** debate and **majority vote**
-on MATH and GPQA, using five agents of the same model (gemini-3.1-flash-lite).
+on MATH and GPQA, first with five copies of one model, then with mixed-skill panels.
 
 **Current best policy: `dual`.** After round 1, the top prestige × confidence agent and the
-strongest agent holding a different answer speak together. It came out ahead of round robin in
-every paired run (+2 to +3 points), with about half the flips, and beats majority vote.
-Pooled over three runs it wins 32 problems to 15 (one-sided p = 0.009); the single planned
-confirmation run was not significant on its own (p = 0.20).
+strongest agent holding a different answer speak together.
+
+- **Clone agents (gemini-3.1-flash-lite):** dual is ahead of round robin in all four paired runs,
+  by about +1 to +3 points, but the pre-registered confirmation on 600 fresh MATH problems was not
+  significant (22 vs 14, one-sided p = 0.12). Its reliability gain was: flips 10.2% → 6.2%,
+  correct → wrong 2.8% → 0.7%.
+- **Mixed panel (one gemini-3.5-flash expert + four flash-lite agents, GPQA 250):** majority vote
+  is stuck at 66.0% while debate reaches the expert's level (round robin 82.4%, dual 84.0%).
+  dual stays there whatever the agent order (flips 16.0% → 4.8%, correct → wrong 11.6% → 2.0%);
+  round robin drops to about 72% when the expert is not the first speaker. Prestige learns the
+  expert (spread 0.146 vs about 0.03 with clones).
 
 ## How it works
 
@@ -141,10 +148,50 @@ New controls: `dual_shuf` (prestige randomly reassigned, tests whether learned p
 (`--panel-file`), one entry per agent: `{"id", "model", "backend": "gemini"|"openai", "base_url" or
 "provider", "thinking", "role"}`.
 
-## Results (gemini-3.1-flash-lite)
+## Results
 
 "Contested" = some agents right and some wrong after round 1. McNemar counts are problems one
 policy got right and the other wrong.
+
+### 0. Latest pre-registered runs (Oct 28–30)
+
+**Clone agents, 600 fresh MATH level 4–5 problems** (`PREREG.md`, gemini-3.1-flash-lite):
+
+| | Accuracy | Contested (109) | Flip | Correct → wrong | First speaker right |
+|---|---|---|---|---|---|
+| Majority vote, no debate | 82.0% | – | – | – | – |
+| Round robin | 83.5% | 72.5% | 10.2% | 2.8% | 38% |
+| **dual** | **84.8%** | **77.1%** | **6.2%** | **0.7%** | **49%** |
+
+Primary test not met: +1.3 points [−0.5, +3.3], 22 vs 14, one-sided p = 0.12. Flips −4.0
+[−6.3, −1.7] and correct → wrong −2.2 [−3.7, −0.7] are significant. Clones agree on most
+problems (only 36 of 600 ended differently), which makes the accuracy test hard to pass.
+
+**Mixed panel, GPQA non-Diamond (250)** (`PREREG_mixed.md`, `mad_dual.py --design expert`:
+gemini-3.5-flash at thinking low + 4 x gemini-3.1-flash-lite):
+
+| | Accuracy | Flip | Correct → wrong |
+|---|---|---|---|
+| Weak agent alone (average) | about 60% | – | – |
+| Majority vote, no debate | 66.0% | – | – |
+| Expert alone (its majority over 3 samples) | 82.4% | – | – |
+| Round robin | 82.4% | 16.0% | 11.6% |
+| **dual** | **84.0%** | **4.8%** | **2.0%** |
+
+- **Debate lets the expert win:** four overconfident weak agents outvote it in a plain vote.
+- **Primary test not met:** dual vs round robin 9 vs 5, one-sided p ≈ 0.21; dual vs the expert
+  alone also 9 vs 5.
+- **Round robin depends on agent order:** the expert was listed first, and round robin's answer
+  matched the expert alone on all 250 questions. With agents reordered it falls to about 72%,
+  while dual stays near 84% (computed from the flip counts). Flips −11.2 [−16.4, −6.0] and
+  correct → wrong −9.6 [−14.0, −5.6] are significant. Next runs place the expert at random.
+- **Prestige learns real skill:** Cochran's Q = 106.8 (p < 0.0001); prestige expert 0.847 vs
+  weak 0.70–0.72; overconfidence +0.13 for the expert vs +0.26 to +0.29 for weak agents.
+- **Choosing the expert:** a 60-question pilot gave 3.5 Flash 91.7% at thinking low and 81.7% at
+  minimal, against about 60% for flash-lite.
+
+**Open-model pilot:** Gemma 4 31B (Ollama Cloud), 30 MATH problems: dual 80.0% vs round robin
+73.3% (2 vs 0), flips 6.7% vs 20.0%. A pipeline check, not evidence.
 
 ### 1. dual vs round robin and majority vote
 
@@ -206,7 +253,9 @@ and the strongest dissenter speak together), not from prestige telling agents ap
 
 | Path | Contents |
 |---|---|
-| `mad_gemini_v5.py` | current script: v4 + mechanism ablations + open-model backend (`--backend openai`) |
+| `mad_dual.py` | current script: everything in v5 + mixed-skill panels (`--design`, `--panel-file`), `*_shuf` controls, thinking-level options |
+| `mixed_report.py`, `run_dual_sizes.sh`, `run_dual_expert.sh`, `serve_models.sh`, `PREREG_mixed.md` | mixed-panel analysis, runners and pre-registration |
+| `mad_gemini_v5.py` | v4 + mechanism ablations + open-model backend (`--backend openai`, `--provider`) |
 | `mad_gemini_v4.py` | all policies, warmup, per-round logging, `pool_dual` |
 | `mad_gemini_v3.py` | adds `dual` / `rr_dual` (same as v4 without `pool_dual`) |
 | `mad_gemini.py`, `mad_gemini_v2.py` | earlier versions (v2: calibrated-challenge policy) |
@@ -217,13 +266,20 @@ and the strongest dissenter speak together), not from prestige telling agents ap
 
 ## Next steps
 
-- One planned, adequately powered test of dual vs round robin (about 500–800 fresh MATH or GPQA problems).
-- A mixed-skill panel, where prestige has real differences to learn.
-- A better within-problem signal for hard questions (e.g., agents rating each other's arguments).
+- Mixed panel with the expert at a random position (primary comparison not tilted by order),
+  plus `dual_shuf` to test whether learned prestige matters.
+- A narrower skill gap (expert at minimal thinking, or 3.1 Flash as the weak agents), where the
+  panel can beat its best member.
+- Mechanism ablations on the MATH confirmation's round-1 answers (`run_confirmation.sh ablations`).
+- Open-model size ladder on a GPU cluster (`run_dual_sizes.sh`).
 
 ## Known issues
 
 - Gemini returns occasional 503 errors; the script retries automatically (`attempt 1/5` is normal).
+- gemini-3.5-flash has a much tighter rate limit than flash-lite: use `--stagger 0.4` or more and
+  `--max-retries 8` for mixed panels.
+- With `--thinking none` / `--weak-thinking none` no thinking setting is sent, so the model uses its
+  own default level; name levels explicitly for reported runs.
 - Five MATH-500 problems are skipped because their reference answer can't be parsed.
 - When several stores are combined in `report`, shared round-1 answers are counted once per store
   in the round-1 summary; policy comparisons are unaffected.
