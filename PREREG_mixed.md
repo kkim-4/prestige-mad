@@ -25,3 +25,5 @@ All agents use the same persona ("careful"); only the model differs.
 
 Hypothesis 2 decides the main claim; 3-5 are secondary and reported whatever their result.
 The "best agent chosen after the fact" line in mixed_report.py is a ceiling, never a baseline.
+
+## Addendum (Oct 30): mixed panel on GPQA non-Diamond (250), 1 seed, run with mad_dual.py: 3.5 Flash (thinking low) + 4 x 3.1 Flash-Lite (model default thinking); policies round_robin, dual. Primary: one-sided exact McNemar, dual vs round robin, alpha 0.05. Secondary: dual vs the expert alone (McNemar), prestige spread and Cochran's Q, flips.
