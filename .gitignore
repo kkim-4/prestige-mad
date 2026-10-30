@@ -24,3 +24,5 @@ gpqa_main_warm*.jsonl
 gpqa*.jsonl
 *_s0.jsonl
 results.json
+pilot_expert_*.jsonl
+gpqa250_mixed.jsonl

@@ -9,6 +9,7 @@ then `huggingface-cli login`.
   pip install datasets huggingface_hub
   python3 make_gpqa.py --out gpqa_diamond.jsonl
   python3 make_gpqa.py --subset main_minus_diamond --out gpqa_warm.jsonl   # 250 non-Diamond questions
+  python3 make_gpqa.py --subset extended --out gpqa_extended.jsonl          # all 546 (includes main + Diamond)
 
 Choices are shuffled with a fixed seed, so the correct letter is spread over A-D
 and the file is identical on every machine.
@@ -21,12 +22,14 @@ import random
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="gpqa_diamond.jsonl")
-    ap.add_argument("--subset", default="diamond", choices=["diamond", "main_minus_diamond"],
+    ap.add_argument("--subset", default="diamond", choices=["diamond", "main_minus_diamond", "extended"],
                     help="main_minus_diamond: GPQA main questions not in Diamond (for warmup / fresh tests)")
     a = ap.parse_args()
     from datasets import load_dataset
     ds = load_dataset("Idavidrein/gpqa", "gpqa_diamond", split="train")
-    if a.subset == "main_minus_diamond":
+    if a.subset == "extended":
+        ds = list(load_dataset("Idavidrein/gpqa", "gpqa_extended", split="train"))
+    elif a.subset == "main_minus_diamond":
         diamond = {d["Question"].strip() for d in ds}
         ds = [d for d in load_dataset("Idavidrein/gpqa", "gpqa_main", split="train")
               if d["Question"].strip() not in diamond]

@@ -1020,8 +1020,8 @@ DESIGNS = {
         {"id": "q14b", "model": "Qwen/Qwen2.5-14B-Instruct", "base_url": _vllm(8005), "role": "expert"},
     ],
     # v8: one expert among four weaker agents
-    "expert": [{"id": "expert", "backend": "gemini", "model": "{expert}", "thinking": "low", "role": "expert"}] +
-              [{"id": f"weak{i}", "backend": "gemini", "model": "{weak}", "thinking": "none", "role": "weak"}
+    "expert": [{"id": "expert", "backend": "gemini", "model": "{expert}", "thinking": "{expert_thinking}", "role": "expert"}] +
+              [{"id": f"weak{i}", "backend": "gemini", "model": "{weak}", "thinking": "{weak_thinking}", "role": "weak"}
                for i in range(1, 5)],
     "expert_open": [{"id": "expert", "model": "{expert}", "base_url": _vllm(8001), "role": "expert"}] +
                    [{"id": f"weak{i}", "model": "{weak}", "base_url": _vllm(8002), "role": "weak"}
@@ -1041,6 +1041,9 @@ def panel_spec(a):
         ex, wk = a.expert_model or ex, a.weak_model or wk
         for d in spec:
             d["model"] = d["model"].replace("{expert}", ex or "").replace("{weak}", wk or "")
+            if "thinking" in d:
+                d["thinking"] = (d["thinking"].replace("{expert_thinking}", a.expert_thinking)
+                                 .replace("{weak_thinking}", a.weak_thinking))
     else:
         return None
     ids = [d["id"] for d in spec]
@@ -1869,7 +1872,7 @@ def main():
     ap.add_argument("--api", default=None, choices=["legacy", "interactions"],
                     help="default legacy; env MAD_API")
     ap.add_argument("--temperature", type=float, default=0.7)
-    ap.add_argument("--thinking", default="low", choices=["low", "high", "none"],
+    ap.add_argument("--thinking", default="low", choices=["minimal", "low", "medium", "high", "none"],
                     help="default low; 'none' disables the flag entirely")
     ap.add_argument("--log", default="calls.jsonl")
     ap.add_argument("--out", default="results.json")
@@ -1922,6 +1925,10 @@ def main():
     ap.add_argument("--panel-file", default=None, help="JSON list of agents for a custom mixed panel")
     ap.add_argument("--expert-model", default=None, help="--design expert*: the strong model")
     ap.add_argument("--weak-model", default=None, help="--design expert*: the weak model (4 agents)")
+    ap.add_argument("--expert-thinking", default="low", choices=["minimal", "low", "medium", "high", "none"],
+                    help="--design expert: the expert's thinking level (none = model default)")
+    ap.add_argument("--weak-thinking", default="none", choices=["minimal", "low", "medium", "high", "none"],
+                    help="--design expert: the weak agents' thinking level (none = model default)")
     ap.add_argument("--max-retries", type=int, default=5,
                     help="openai backend: tries per call (backoff doubles each time; raise to 8 for free tiers)")
     ap.add_argument("--openai-extra", default=None,
