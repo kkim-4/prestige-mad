@@ -1,8 +1,8 @@
 """Mixed-skill panel report: is the panel better than its strongest member, and did prestige
 learn who is strong? No API calls.
 
-    python3 mixed_report.py dual_sizes.jsonl
-    python3 mixed_report.py dual_expert.jsonl --policies round_robin,dual,dual_shuf,prestige_x_conf
+    python3 analysis/mixed_report.py dual_sizes.jsonl
+    python3 analysis/mixed_report.py dual_expert.jsonl --policies round_robin,dual,dual_shuf,prestige_x_conf
 
 Prints, from the stored run:
   1. per agent: round-1 accuracy (its own majority over 3 samples), mean confidence,
@@ -13,7 +13,7 @@ Prints, from the stored run:
 """
 import json, math, sys, os
 from collections import defaultdict
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root
 from mad_gemini import answers_match, prestige_path
 
 

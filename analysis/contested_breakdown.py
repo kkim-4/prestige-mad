@@ -7,12 +7,14 @@ A problem-run is classified by the agents' independent round-1 answers:
   all right   every agent right
   all wrong   every agent wrong (no speaker choice can fix these)
 
-  python3 contested_breakdown.py --store runs/2026-10-05_selfconsistency_3seed_n230/sc.jsonl
+  python3 analysis/contested_breakdown.py --store runs/2026-10-05_selfconsistency_3seed_n230/sc.jsonl
 """
 import argparse
 import json
 from collections import defaultdict
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root
 from mad_gemini import answers_match
 
 

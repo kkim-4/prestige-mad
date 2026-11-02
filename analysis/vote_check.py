@@ -1,7 +1,7 @@
 """How would other final votes have done? Re-scores stored debates offline (no API calls).
 
-    python3 vote_check.py gpqa250_mixed.jsonl
-    python3 vote_check.py confirm_math45.jsonl --policies round_robin,dual
+    python3 analysis/vote_check.py gpqa250_mixed.jsonl
+    python3 analysis/vote_check.py confirm_math45.jsonl --policies round_robin,dual
 
 The debates themselves don't depend on the vote: agents never see how the final answer is
 counted, so each agent's last-round answer is the same under any rule, and swapping the rule
@@ -32,7 +32,7 @@ rule here, then pre-register it for the next run.
 """
 import argparse, json, math, os, random, sys
 from collections import defaultdict
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root
 from mad_gemini import answers_match
 
 MIX = lambda t: (t["confidence"] + t.get("stated_confidence", t["confidence"])) / 2

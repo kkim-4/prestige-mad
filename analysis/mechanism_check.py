@@ -1,11 +1,11 @@
 """Why does dual help? Splits dual's debates by which of its two round-1 speakers was right,
 and shows how the group moved in round 2 and where it ended. No API calls.
 
-    python3 mechanism_check.py gpqa_v4.jsonl gpqa_main_v4.jsonl math_dual.jsonl
+    python3 analysis/mechanism_check.py gpqa_v4.jsonl gpqa_main_v4.jsonl math_dual.jsonl
 """
 import json, sys, os
 from collections import defaultdict
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root
 from mad_gemini import answers_match
 
 

@@ -1,9 +1,9 @@
 """Would a plain majority over the agents' final answers beat the stored weighted vote?
-No API calls.   python3 revote.py sc.jsonl math_fix.jsonl gpqa.jsonl gpqa_fix.jsonl
+No API calls.   python3 analysis/revote.py sc.jsonl math_fix.jsonl gpqa.jsonl gpqa_fix.jsonl
 """
 import json, sys, os
 from collections import defaultdict
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root
 from mad_gemini import answers_match
 def maj(ans, truth):
     g=[]

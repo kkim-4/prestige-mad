@@ -14,7 +14,7 @@ Reading the output:
 
 Usage (use the --until timestamp printed by `date +%s` before the debate run, so
 only the solo calib run and earlier are used):
-  python3 verify_prestige_replay.py --calls calls.jsonl --problems math.jsonl \
+  python3 analysis/verify_prestige_replay.py --calls calls.jsonl --problems math.jsonl \
       --model gemini-3.1-flash-lite --until 1790483022
 """
 import argparse
@@ -22,6 +22,8 @@ import json
 import random
 import statistics as st
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root
 from mad_gemini import answers_match, brier, load_jsonl
 
 AG = ["careful", "fast", "skeptic", "teacher", "contrarian"]

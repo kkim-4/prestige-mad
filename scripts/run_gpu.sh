@@ -4,17 +4,18 @@
 # One-time setup on the GPU machine (Linux + NVIDIA GPU):
 #   pip install vllm openai google-genai pydantic sympy datasets
 #   huggingface-cli login            # only for gated models (Gemma, Llama) and GPQA
-#   python3 make_math_extra.py --exclude math.jsonl --out math_extra.jsonl
+#   python3 scripts/make_math_extra.py --exclude math.jsonl --out math_extra.jsonl
 #
 # Run (defaults: Qwen2.5-7B-Instruct, the pre-registered 600 MATH level 4-5 problems, all ablations):
-#   bash run_gpu.sh
-#   MODEL=google/gemma-3-12b-it bash run_gpu.sh
-#   MODEL=Qwen/Qwen3-8B EXTRA='{"chat_template_kwargs":{"enable_thinking":false}}' bash run_gpu.sh
-#   PROBLEMS=gpqa_extended.jsonl N=546 LEVEL= SEEDS=3 bash run_gpu.sh   # GPQA (python3 make_gpqa.py --subset extended)
+#   bash scripts/run_gpu.sh
+#   MODEL=google/gemma-3-12b-it bash scripts/run_gpu.sh
+#   MODEL=Qwen/Qwen3-8B EXTRA='{"chat_template_kwargs":{"enable_thinking":false}}' bash scripts/run_gpu.sh
+#   PROBLEMS=gpqa_extended.jsonl N=546 LEVEL= SEEDS=3 bash scripts/run_gpu.sh   # GPQA (python3 scripts/make_gpqa.py --subset extended)
 #
 # Calls cost nothing per token here; the limit is GPU time. Results are resumable: rerun the
 # same command after a crash. Each model gets its own store (named after the model).
 set -euo pipefail
+cd "$(dirname "$0")/.."   # run from the repo root
 MODEL=${MODEL:-Qwen/Qwen2.5-7B-Instruct}
 PORT=${PORT:-8000}
 PROBLEMS=${PROBLEMS:-math_extra.jsonl}
@@ -50,12 +51,12 @@ ARGS=(--backend openai --model "$MODEL" --problems "$PROBLEMS" --n "$N" --seeds 
 [[ -n "$EXTRA" ]] && ARGS+=(--openai-extra "$EXTRA")
 
 echo "== smoke test (one call)"
-python3 mad_gemini_v5.py smoke --backend openai --model "$MODEL" ${EXTRA:+--openai-extra "$EXTRA"}
+python3 mad_dual.py smoke --backend openai --model "$MODEL" ${EXTRA:+--openai-extra "$EXTRA"}
 echo "== plan"
-python3 mad_gemini_v5.py trials "${ARGS[@]}" --dry-run
+python3 mad_dual.py trials "${ARGS[@]}" --dry-run
 echo "== running -> $STORE"
-python3 mad_gemini_v5.py trials "${ARGS[@]}"
+python3 mad_dual.py trials "${ARGS[@]}"
 echo "== analysis"
-python3 round_metrics.py "$STORE" --contested
-python3 mechanism_check.py "$STORE"
-python3 signal_check.py "$STORE"
+python3 analysis/round_metrics.py "$STORE" --contested
+python3 analysis/mechanism_check.py "$STORE"
+python3 analysis/signal_check.py "$STORE"

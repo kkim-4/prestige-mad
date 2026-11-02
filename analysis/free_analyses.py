@@ -2,7 +2,7 @@
 """
 free_analyses.py — extra paired tests from a stored trials run (no API calls).
 
-  python3 free_analyses.py --store runs/2026-10-05_selfconsistency_3seed_n230/sc.jsonl
+  python3 analysis/free_analyses.py --store runs/2026-10-05_selfconsistency_3seed_n230/sc.jsonl
 
 1. prestige x confidence vs confidence only (accuracy, flips)
 2. each debate policy vs majority vote with no debate (accuracy)
@@ -14,6 +14,8 @@ import math
 import random
 from collections import defaultdict
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root
 from mad_gemini import answers_match
 
 

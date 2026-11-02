@@ -1,8 +1,8 @@
 """Order-sensitivity of each policy: what happens to the final answer when the same debate is
 rerun with the agents in a different order. No API calls.
 
-    python3 flip_breakdown.py gpqa250_mixed.jsonl
-    python3 flip_breakdown.py confirm_math45.jsonl gpqa250_mixed.jsonl
+    python3 analysis/flip_breakdown.py gpqa250_mixed.jsonl
+    python3 analysis/flip_breakdown.py confirm_math45.jsonl gpqa250_mixed.jsonl
 
 For each policy (over all problem-runs; problems with no debate never change):
   original acc   accuracy in the original agent order (what `report` calls accuracy)
@@ -15,7 +15,7 @@ Then policies are compared head to head in the original order and in the reorder
 """
 import json, math, sys, os
 from collections import defaultdict
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root
 from mad_gemini import answers_match
 
 

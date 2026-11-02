@@ -1,8 +1,8 @@
 """Per-round metrics for debates stored by `mad_gemini.py trials` (needs runs made after
 per-round logging was added: debate rows with canon.rounds). No API calls.
 
-    python3 round_metrics.py gpqa_rounds.jsonl
-    python3 round_metrics.py gpqa_rounds.jsonl --contested    # only problems with some right, some wrong
+    python3 analysis/round_metrics.py gpqa_rounds.jsonl
+    python3 analysis/round_metrics.py gpqa_rounds.jsonl --contested    # only problems with some right, some wrong
 
 For each policy, on problems where the debate ran, round by round:
   vote right   plain majority vote over the agents' answers in that round
@@ -13,7 +13,7 @@ For each policy, on problems where the debate ran, round by round:
 """
 import json, sys, os
 from collections import defaultdict, Counter
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root
 from mad_gemini import answers_match
 
 

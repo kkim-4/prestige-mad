@@ -1,7 +1,7 @@
 """Does confidence or prestige carry signal? Uses stored round-1 answers only (no API calls).
 
-    python3 signal_check.py gpqa.jsonl            # any trials store; several can be given
-    python3 signal_check.py sc.jsonl gpqa.jsonl
+    python3 analysis/signal_check.py gpqa.jsonl            # any trials store; several can be given
+    python3 analysis/signal_check.py sc.jsonl gpqa.jsonl
 
 For each store it prints:
   1. Are the agents actually different?  Per-agent accuracy + Cochran's Q test.
@@ -16,7 +16,7 @@ For each store it prints:
 """
 import json, math, sys, os
 from collections import defaultdict
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # repo root
 from mad_gemini import answers_match, prestige_path
 
 SIG = {
