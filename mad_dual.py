@@ -15,6 +15,8 @@ Every agent uses the same persona ("careful"), so the model is the only differen
 New controls:
   <policy>_shuf   same policy with prestige randomly reassigned among agents (fixed per run):
                   if learned prestige matters, e.g. dual_shuf < dual.
+  dual_conf       dual with prestige switched off (every agent held at the 0.5 prior), so speakers
+                  and tie-breaks follow confidence alone: if the track record matters, dual_conf < dual.
   mixed_report.py the strongest single agent alone, per-agent calibration, prestige spread,
                   and every policy vs the pre-designated expert (McNemar).
 
@@ -1373,7 +1375,8 @@ def cmd_trials(a):
     pols = a.policies.split(",")
     if a.policies == ",".join(POLICIES):
         pols = ["round_robin", "prestige_x_conf"]          # default: the main comparison
-    bad = [p for p in pols if p not in TRIAL_POLICIES and not (p.endswith("_shuf") and p[:-5] in TRIAL_POLICIES)]
+    bad = [p for p in pols if p not in TRIAL_POLICIES and p != "dual_conf"
+           and not (p.endswith("_shuf") and p[:-5] in TRIAL_POLICIES)]
     if bad:
         sys.exit(f"trials supports {TRIAL_POLICIES}; {bad} need a warmup phase (use `debate`).")
     if not a.mock and not a.model and not a.panel and not panel_spec(a):
@@ -1391,6 +1394,7 @@ def cmd_trials(a):
            "prestige_mode": a.prestige_mode, "alpha": a.alpha, "prior_strength": a.prior_strength,
            "rule": a.rule, "tau": a.tau, "disjoint": a.disjoint}
     for k, v in (("panel", a.panel), ("offset", a.offset), ("stop_unanimous", a.stop_unanimous),
+                 ("seat_shuffle", getattr(a, "seat_shuffle", False)),
                  ("sc_k", a.sc_k if a.sc_k > 1 else None), ("sc_carry", a.sc_carry),
                  ("conf_mix", a.conf_mix if a.conf_mix != "sc" else None),
                  ("warmup_from", os.path.basename(a.warmup_from) if a.warmup_from else None),
@@ -1509,8 +1513,10 @@ def cmd_trials(a):
 
         def do_debate(pol, i, probs=probs, agents=agents, ids=ids, qids=qids, path=path, r0=r0, seed=seed):
             p, qid = probs[i], qids[i]
-            opol = pol[:-5] if pol.endswith("_shuf") else pol
+            opol = pol[:-5] if pol.endswith("_shuf") else ("dual" if pol == "dual_conf" else pol)
             vals = dict(path[i])
+            if pol == "dual_conf":   # dual with prestige switched off: everyone held at the 0.5 prior
+                vals = {aid: 0.5 for aid in ids}
             if opol != pol:   # shuffled-prestige control: a fixed random reassignment for the whole run
                 sh = ids[:]
                 rr = random.Random(f"shuf:{seed}")
@@ -1530,15 +1536,18 @@ def cmd_trials(a):
                                                pool=pool if opol == "pool_dual" else None)
             perm = agents[:]
             random.Random(f"{seed}:{qid}").shuffle(perm)
+            seats = agents[:]
+            if a.seat_shuffle:      # random seating per problem, the same for every policy (stays paired)
+                random.Random(f"seat:{seed}:{qid}").shuffle(seats)
             with ThreadPoolExecutor(max_workers=2) as ex:      # canonical + reordered run side by side
-                f_canon = ex.submit(mk(agents, "canon").run, p, False, first)
+                f_canon = ex.submit(mk(seats, "canon").run, p, False, first)
                 f_pert = ex.submit(mk(perm, "order").run, p, False, first)
                 canon, pert = f_canon.result(), f_pert.result()
             calls = sum(len(v) - 1 for v in canon.submissions.values()) + \
                     sum(len(v) - 1 for v in pert.submissions.values())
             store.add({"kind": "debate", "seed": seed, "policy": lab(pol), "qid": qid, "pid": i,
                        "truth": p["answer"], "prestige": path[i], "calls": calls,
-                       "canon": {"final": canon.final_answer,
+                       "canon": {"final": canon.final_answer, "seats": [x.agent_id for x in seats],
                                  "speakers": [t["speaker"] for t in canon.transcript],
                                  "speaker_rounds": [t["round"] for t in canon.transcript],
                                  "last": {k: v[-1].answer for k, v in canon.submissions.items()},
@@ -1896,6 +1905,9 @@ def main():
                     help="trials: mixed panel, e.g. 'careful@gemini-3.8-flash:low,fast@gemini-3.1-flash-lite:none'")
     ap.add_argument("--offset", type=int, default=0, help="trials: skip the first N problems (use fresh ones)")
     ap.add_argument("--stop-unanimous", action="store_true", help="trials: end a debate once every agent agrees")
+    ap.add_argument("--seat-shuffle", action="store_true",
+                    help="trials: seat the agents in a random order per problem (same for every policy), "
+                         "so no agent, e.g. the expert, always speaks first in the original order")
     ap.add_argument("--resample-store", default="resample.jsonl", help="resample: output file")
     ap.add_argument("--conf-mix", default="sc", choices=["sc", "avg"],
                     help="trials: round-1 confidence = self-consistency (sc) or its average with stated confidence (avg)")
