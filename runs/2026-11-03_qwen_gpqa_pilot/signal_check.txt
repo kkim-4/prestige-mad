@@ -1,0 +1,44 @@
+
+==============================================================================
+H100 pilot (job 13543): 99 problem-runs, 1 seed(s), agents ['expert', 'weak1', 'weak2', 'weak3', 'weak4']
+
+1. Are the agents different? (round-1 accuracy, same problems)
+     expert       0.303
+     weak1        0.354
+     weak2        0.333
+     weak3        0.273
+     weak4        0.354
+   Cochran's Q = 4.03, p = 0.401  (no evidence the agents differ -> prestige has little real to learn)
+   prestige at the end of the run: expert 0.511, weak1 0.547, weak2 0.532, weak3 0.496, weak4 0.528
+
+2. Does confidence separate right from wrong?   contested problems: 51/99
+   signal                    AUROC all   within contested
+   self-consistency              0.570              0.595
+   stated                        0.547              0.544
+   average (conf-mix avg)        0.593              0.616
+   (within contested = P(a right agent is more confident than a wrong agent on the same problem); 0.5 = useless for picking speakers)
+
+3-4. Contested problems: is the top-weighted agent right, and does the weighted vote get it right?
+
+   all contested problems  (n = 51)
+   weights                             1st speaker right  weighted vote right
+   random speaker / plain majority                 45.1%                48.0%
+   confidence (avg)                                58.2%                50.0%
+   prestige only                                   43.1%                51.0%
+   prestige x confidence                           49.0%                51.0%
+   ORACLE prestige x confidence                    52.9%                49.0%
+   ORACLE log-odds x confidence                    37.3%                33.3%
+
+   contested problems after the first 40% (same set, so warmup is comparable)  (n = 29)
+   weights                             1st speaker right  weighted vote right
+   random speaker / plain majority                 44.8%                50.0%
+   confidence (avg)                                44.9%                51.7%
+   prestige only                                   51.7%                51.7%
+   prestige x confidence                           37.9%                51.7%
+   prestige x conf, 40% warmup                     41.4%                48.3%
+   ORACLE prestige x confidence                    44.8%                48.3%
+   ORACLE log-odds x confidence                    41.4%                37.9%
+
+   Reading: if 'prestige x confidence' is no better than 'confidence (avg)', prestige adds nothing
+   to speaker choice; if even the ORACLE rows don't beat it, no amount of warmup can help,
+   because the agents are not reliably different.
