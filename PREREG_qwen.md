@@ -1,53 +1,70 @@
-# Pre-registration: dual on an open-model mixed panel (GPQA)
+# Pre-registration: dual on an open-model mixed panel (Qwen2.5, MATH)
 
 Commit this file before `bash scripts/run_qwen.sh full`, so the date is on record.
 
-**Amendment, 2026-11-02, before any run (pilot or full):** the primary test moves from 600 MATH
-level 4-5 problems to GPQA extended (546 questions), to match the task of the Gemini mixed panel.
-Panel, policies, seating and test are unchanged. No Qwen results of any kind existed at this point.
-
-## Why this panel
-On the Gemini mixed panel (3.5 Flash expert at 82% vs four Flash-Lite agents at about 60%, GPQA),
-confidence alone already found the expert, so the track record had nothing extra to do. This panel
-uses two open models from one family with a smaller gap: Qwen2.5-7B-Instruct as the expert and four
-Qwen2.5-3B-Instruct agents. Both are expected to sit well below the Gemini agents and closer to the
-25% chance level, so the pilot checks first that they differ at all.
-
-## Pilot (not part of any test)
-Round-1 answers only, first 100 questions, separate store. Used only to check that (a) the agents
-differ (Cochran's Q, p < 0.05), (b) the expert is clearly above chance, and (c) replies parse.
-No debates are run, so the pilot reveals nothing about the hypotheses.
-If (a) or (b) fails, the weak model becomes Qwen2.5-1.5B-Instruct and this file is amended
-(and committed) before the full run. If that also fails, the GPQA run is dropped and reported as
-"open models of this size are too close to chance on GPQA for the test to be informative".
+## History
+- **2026-11-02.** Original plan: 600 MATH level 4-5 problems, dual vs single-speaker round robin.
+  Amended the same day, before any run, to GPQA extended.
+- **2026-11-03, GPQA pilot (Slurm job 13543, round 1 only, 99 of 100 questions).** The 7B expert scored
+  30.3% (chance is 25%) and below three of the four 3B agents; Cochran's Q = 4.03, p = 0.40. Both pilot
+  checks failed. The planned fallback (a 1.5B weak model) was not run: the failure was the expert
+  itself being near chance and no better than the 3Bs, which a weaker weak model cannot fix. The GPQA
+  arm is reported as uninformative for open models of this size. No debates were run.
+- **2026-11-09, this version, before any MATH run with these models.** Back to MATH. Two standard debate
+  formats are added as baselines, because the original "round robin" is a single-speaker rotation
+  (only seats 1 and 2 are ever heard), which is weaker than the formats used in the literature.
+  Three design variants are added to test why dual is shaped the way it is.
 
 ## Setup (fixed)
 - **Panel:** expert = Qwen/Qwen2.5-7B-Instruct, four weak = Qwen/Qwen2.5-3B-Instruct, served by vLLM,
   temperature 0.7, same persona for all.
-- **Questions:** GPQA extended, all 546 (`scripts/make_gpqa.py --subset extended`, options shuffled with
-  the script's fixed seed). The question file is not committed (gated dataset).
+- **Problems:** the 600 MATH level 4-5 problems of the Gemini confirmation (`math_extra.jsonl`,
+  `--level 4,5 --n 600`, fixed shuffle).
 - **Settings:** `--sc-k 3 --sc-carry --rounds 3 --conf-mix avg --stop-unanimous`, 1 seed, all
-  policies sharing the same round-1 answers.
-- **Seating:** `--seat-shuffle`: a random seating order per question, the same for every policy, so the
-  expert is not always first (that favoured round robin on the Gemini panel). Each debate is also
-  rerun in a second random order, as before.
-- **Policies:** `round_robin`, `dual`, `dual_shuf` (prestige reassigned among agents),
-  `dual_conf` (dual with prestige switched off, confidence alone).
+  policies sharing the same round-1 answers. Context limit 16,384 tokens.
+- **Seating:** `--seat-shuffle` (random seating per problem, the same for every policy). Each debate is
+  also rerun in a second random seating.
+- **Noise floor:** a separate run (`noise` stage) reruns `all_speak`, `dual` and `seq_rr` in the *same*
+  seating on the same round-1 answers, so its flip rate is what re-asking the models alone produces.
+
+## Pilot (not part of any test)
+Round-1 answers only, first 100 problems, separate store. Go on only if the agents differ
+(Cochran's Q, p < 0.05) and replies parse. If not, the weak model becomes Qwen2.5-1.5B-Instruct and this
+file is amended before the full run. No debates are run in the pilot.
+
+## Policies
+| Policy | Who is heard | Role |
+|---|---|---|
+| `all_speak` | everyone, every round (simultaneous, Du et al.) | main baseline |
+| `seq_rr` | everyone, in seat order, each seeing earlier seats | order-sensitive baseline |
+| `round_robin` | one speaker per round by seat (single-speaker rotation) | earlier baseline, kept for continuity |
+| `dual` | top prestige x confidence + top dissenter; then top agent with an unheard answer | the policy |
+| `dual_conf` | dual with prestige switched off (confidence only) | does the track record matter? |
+| `dual_shuf` | dual with prestige reassigned among agents | does picking the right agent matter? |
+| `dual_2lead` | two voices for the leader's answer + the top dissenter | does redundancy add herding? |
+| `dual_2diss` | leader + two dissenters (different answers when possible) | does a third answer help? |
+| `per_answer` | best advocate of every distinct answer | full coverage, one voice each |
 
 ## Primary test (one)
-One-sided exact McNemar on final-answer accuracy, dual vs round robin, alpha = 0.05.
-Confirmed if p < 0.05 and dual has more discordant wins. Nothing is added, dropped or rerun after
-seeing results, except automatic retries of failed calls.
+**Dual is non-inferior to simultaneous debate (`all_speak`) in final-answer accuracy while broadcasting
+far fewer arguments.** Confirmed if the lower end of the 95% paired bootstrap interval for
+accuracy(dual) - accuracy(all_speak) is above -2 points (`mad_dual_v3.py report --ref all_speak`).
+Nothing is added, dropped or rerun after seeing results, except automatic retries of failed calls.
 
 ## Secondary (reported, not used for the decision)
-1. dual vs `dual_conf`: does the track record add to confidence? Prediction: dual ahead.
-2. dual vs `dual_shuf`: does dual gain from finding the right agent, or only from the two-speaker
-   structure? Prediction: dual ahead.
-3. Flip rate and correct -> wrong under reordering, dual vs round robin. Prediction: dual lower.
-4. Accuracy in the reordered runs, dual vs round robin (`analysis/flip_breakdown.py`).
-5. Each policy vs the expert alone and vs majority vote without debate (`analysis/mixed_report.py`).
-6. Speaker choice on contested questions: how often the first speaker is right under prestige vs
-   confidence (`analysis/signal_check.py`).
+1. **Right minority** (1-2 of 5 agents right after round 1): dual ends correct more often than
+   `all_speak` (one-sided exact McNemar, `analysis/minority_check.py`). Mechanism: in simultaneous
+   debate a right minority's argument arrives alongside the majority's and is outweighed (herding).
+2. **Right majority** (3-4 of 5 right): dual's losses against `all_speak` are small (two-sided McNemar).
+3. **Order:** flip rate and correct -> wrong under reseating, dual vs `seq_rr` and vs `round_robin`
+   (predicted: dual lower). For `dual` and `all_speak`, flip rates are compared with the noise floor
+   (predicted: close to it, since both are anonymous); for `seq_rr` (predicted: above it).
+4. **Design variants vs dual** (one-sided McNemar each, Holm-corrected as a family of five):
+   `dual_conf` and `dual_shuf` predicted below dual; `dual_2lead` predicted below dual on right-minority
+   problems; `dual_2diss` and `per_answer` predicted about equal on MATH (few problems with three live
+   answers), reported two-sided.
+5. **Cost:** arguments shown per agent per debate, from the stored transcripts, for each policy.
+6. Each policy vs the expert alone and vs majority vote without debate (`analysis/mixed_report.py`).
 
-Secondary comparisons 1-2 are each one-sided McNemar at 0.05; with several of them, a single
-p < 0.05 is read with caution. Vote re-scoring (`analysis/vote_check.py`) is exploratory.
+Vote re-scoring (`analysis/vote_check.py`) and speaker-signal analysis (`analysis/signal_check.py`)
+are exploratory.
