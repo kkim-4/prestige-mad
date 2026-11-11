@@ -48,7 +48,7 @@ file is amended before the full run. No debates are run in the pilot.
 ## Primary test (one)
 **Dual is non-inferior to simultaneous debate (`all_speak`) in final-answer accuracy while broadcasting
 far fewer arguments.** Confirmed if the lower end of the 95% paired bootstrap interval for
-accuracy(dual) - accuracy(all_speak) is above -2 points (`mad_dual_v3.py report --ref all_speak`).
+accuracy(dual) - accuracy(all_speak) is above -2 points (`mad_dual_v4.py report --ref all_speak`).
 Nothing is added, dropped or rerun after seeing results, except automatic retries of failed calls.
 
 ## Secondary (reported, not used for the decision)
@@ -68,3 +68,12 @@ Nothing is added, dropped or rerun after seeing results, except automatic retrie
 
 Vote re-scoring (`analysis/vote_check.py`) and speaker-signal analysis (`analysis/signal_check.py`)
 are exploratory.
+
+## Addendum, 2026-11-11 (before any Qwen MATH run)
+- `per_answer_last` is added: the same arguments as `per_answer`, with the most trusted one listed last.
+  Secondary test: more wrong agents are right by round 2 than under `per_answer` (the order effect seen
+  on Gemini: 49% vs 95% conversion by position).
+- A nine-agent panel (`DESIGN=expert_open9`: one 7B expert + eight 3B) is run as a separate store with
+  the same policies. Prediction: the gap between `per_answer` and `all_speak` on right-minority
+  problems is larger with nine agents than with five. Reported as secondary.
+- The Gemini run of 2026-11-10 found `per_answer` ahead of `all_speak`; the primary test here is unchanged.

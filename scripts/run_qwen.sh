@@ -8,6 +8,8 @@
 #   bash scripts/run_qwen.sh report   # all analyses (no GPU calls)
 #
 #   WEAK=Qwen/Qwen2.5-1.5B-Instruct bash scripts/run_qwen.sh pilot   # fallback if the 3B and 7B don't differ
+#   DESIGN=expert_open9 bash scripts/run_qwen.sh full                # nine agents (1 expert + 8 weak): scaling test;
+#                                                                    # it is a separate store with its own round 1
 # Stop the model servers afterwards with:  pkill -f "vllm serve"
 set -euo pipefail
 cd "$(dirname "$0")/.."   # run from the repo root
@@ -16,15 +18,16 @@ EXPERT=${EXPERT:-Qwen/Qwen2.5-7B-Instruct}
 WEAK=${WEAK:-Qwen/Qwen2.5-3B-Instruct}
 PROBLEMS=${PROBLEMS:-math_extra.jsonl}
 N=${N:-600}
-TAG=$(basename "$EXPERT")_vs_$(basename "$WEAK")
+DESIGN=${DESIGN:-expert_open}     # expert_open = 1 expert + 4 weak; expert_open9 = 1 expert + 8 weak
+TAG=$(basename "$EXPERT")_vs_$(basename "$WEAK")$([[ "$DESIGN" == expert_open ]] || echo "_$DESIGN")
 STORE=${STORE:-qwen_${TAG}_math45.jsonl}
 PILOT=${PILOT:-qwen_${TAG}_math45_pilot.jsonl}
 NOISE=${NOISE:-qwen_${TAG}_math45_noise.jsonl}
-POLICIES=${POLICIES:-all_speak,dual,round_robin,seq_rr,dual_conf,dual_shuf,dual_2lead,dual_2diss,per_answer}
-NOISE_POLICIES=${NOISE_POLICIES:-all_speak,dual,seq_rr}
+POLICIES=${POLICIES:-all_speak,per_answer,per_answer_last,dual,seq_rr,dual_conf,dual_shuf,dual_2lead,dual_2diss,round_robin}
+NOISE_POLICIES=${NOISE_POLICIES:-all_speak,per_answer,seq_rr}
 export MAXLEN=${MAXLEN:-16384}
 
-PANEL=(--design expert_open --expert-model "$EXPERT" --weak-model "$WEAK")
+PANEL=(--design "$DESIGN" --expert-model "$EXPERT" --weak-model "$WEAK")
 COMMON=("${PANEL[@]}" --problems "$PROBLEMS" --level 4,5 --seeds 1 --sc-k 3 --sc-carry --rounds 3
         --conf-mix avg --stop-unanimous --stagger 0 --workers 24 --price-per-call 0
         --max-retries 8 --max-tokens 2048)
@@ -32,19 +35,19 @@ COMMON=("${PANEL[@]}" --problems "$PROBLEMS" --level 4,5 --seeds 1 --sc-k 3 --sc
 serve() {
   [[ -f "$PROBLEMS" ]] || python3 scripts/make_math_extra.py --exclude math.jsonl --out "$PROBLEMS"
   bash scripts/serve_models.sh "$EXPERT 8001 0 0.45" "$WEAK 8002 0 0.35"
-  python3 mad_dual_v3.py smoke "${PANEL[@]}"
+  python3 mad_dual_v4.py smoke "${PANEL[@]}"
 }
 
 confirm_run() {   # dry run, ask, run
-  python3 mad_dual_v3.py trials "$@" --dry-run
+  python3 mad_dual_v4.py trials "$@" --dry-run
   read -r -p "Run it? [y/N] " ok; [[ "$ok" == "y" || "$ok" == "Y" ]] || exit 0
-  python3 mad_dual_v3.py trials "$@"
+  python3 mad_dual_v4.py trials "$@"
 }
 
 case "$STAGE" in
   pilot)
     serve
-    python3 mad_dual_v3.py trials "${COMMON[@]}" --n 100 --round1-only --store "$PILOT"
+    python3 mad_dual_v4.py trials "${COMMON[@]}" --n 100 --round1-only --store "$PILOT"
     python3 analysis/signal_check.py "$PILOT"
     echo
     echo "Go on to 'full' if section 1 shows the agents differ (Cochran's Q p < 0.05) and few calls failed."
@@ -59,7 +62,7 @@ case "$STAGE" in
     confirm_run "${COMMON[@]}" --n "$N" --seat-shuffle --same-order-rerun --policies "$NOISE_POLICIES" \
       --store "$NOISE" --init-from "$STORE" ;;
   report)
-    python3 mad_dual_v3.py report --store "$STORE" --policies "$POLICIES" --ref all_speak
+    python3 mad_dual_v4.py report --store "$STORE" --policies "$POLICIES" --ref all_speak
     python3 analysis/minority_check.py "$STORE" --ref all_speak
     python3 analysis/flip_breakdown.py "$STORE"
     [[ -f "$NOISE" ]] && python3 analysis/flip_breakdown.py "$NOISE"
