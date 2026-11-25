@@ -1,0 +1,13 @@
+runs/prestige_qwen_math45_n600.jsonl: 600 questions, agents ['expert', 'weak1', 'weak2', 'weak3', 'weak4']
+round-1 accuracy (= final prestige): expert 0.147, weak1 0.080, weak2 0.063, weak3 0.068, weak4 0.075
+
+== all questions: 600 questions, 587 contested
+   majority vote (no debate) 11.2%   top-prestige agent alone (expert) 14.7%
+   policy        all (2 seatings avg)  contested   flips
+   prestige                     14.2%      14.1%   56.5%
+   all_speak                    18.1%      18.1%   48.0%
+   prestige vs all_speak, contested: -4.0% (both seatings) 95% CI [-6.1%, -1.9%]
+     exact McNemar, first seating: prestige right & all_speak wrong 25, reverse 43, p = 0.038
+     prestige vs top agent alone: 27 vs 22, p = 0.568
+     all_speak vs top agent alone: 47 vs 24, p = 0.009
+

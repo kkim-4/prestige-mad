@@ -1,0 +1,7 @@
+600 questions, 592 with both debates; unpaired contested questions are left out
+stored rule reproduces the saved final answer in 1184/1184 debates
+  prestige   stored    contested accuracy  31.4%   vs all_speak -11.8% [-15.5%, -8.3%]
+  prestige   clipped   contested accuracy  44.0%   vs all_speak +0.8% [-1.8%, +3.2%]
+  prestige   linear    contested accuracy  48.8%   vs all_speak +5.6% [+3.0%, +8.2%]
+  prestige   majority  contested accuracy  44.0%   vs all_speak +0.8% [-1.8%, +3.2%]
+  all_speak  majority  contested accuracy  43.2%   vs all_speak +0.0% [+0.0%, +0.0%]

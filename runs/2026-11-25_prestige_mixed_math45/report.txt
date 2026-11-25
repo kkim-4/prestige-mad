@@ -1,0 +1,14 @@
+
+store.jsonl: 600 questions, agents ['qwen3_8b', 'ministral3_8b', 'nemotron_8b', 'gemma3_4b', 'phi4_mini']
+round-1 accuracy (= final prestige): qwen3_8b 0.248, ministral3_8b 0.192, nemotron_8b 0.098, gemma3_4b 0.152, phi4_mini 0.073
+
+== all questions: 600 questions, 592 contested
+   majority vote (no debate) 24.8%   top-prestige agent alone (qwen3_8b) 24.8%
+   policy        all (2 seatings avg)  contested   flips
+   prestige                     21.2%      20.7%   75.2%
+   all_speak                    41.5%      41.2%   39.0%
+   prestige vs all_speak, contested: -20.5% (both seatings) 95% CI [-24.2%, -17.1%]
+     exact McNemar, first seating: prestige right & all_speak wrong 31, reverse 152, p = 0.000
+     prestige vs top agent alone: 62 vs 83, p = 0.096
+     all_speak vs top agent alone: 126 vs 26, p = 0.000
+

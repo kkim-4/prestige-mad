@@ -1,0 +1,14 @@
+
+store.jsonl: 600 questions, agents ['expert', 'weak1', 'weak2', 'weak3', 'weak4']
+round-1 accuracy (= final prestige): expert 0.145, weak1 0.078, weak2 0.063, weak3 0.068, weak4 0.073
+
+== all questions: 600 questions, 587 contested
+   majority vote (no debate) 11.0%   top-prestige agent alone (expert) 14.5%
+   policy        all (2 seatings avg)  contested   flips
+   prestige                     14.1%      14.1%   56.5%
+   all_speak                    17.9%      18.0%   48.2%
+   prestige vs all_speak, contested: -3.9% (both seatings) 95% CI [-6.0%, -1.8%]
+     exact McNemar, first seating: prestige right & all_speak wrong 25, reverse 43, p = 0.038
+     prestige vs top agent alone: 27 vs 22, p = 0.568
+     all_speak vs top agent alone: 47 vs 24, p = 0.009
+
